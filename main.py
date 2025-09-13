@@ -1,6 +1,7 @@
 # astrbot_plugin_GroupFS/main.py
 
 import asyncio
+import os # 用于处理文件路径和扩展名
 from typing import List, Dict, Optional
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -26,7 +27,6 @@ class GroupFSPlugin(Star):
 
     @filter.command("df")
     async def on_delete_file_command(self, event: AstrMessageEvent):
-        # ... (这部分代码和之前一样，保持不变)
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         
@@ -53,84 +53,74 @@ class GroupFSPlugin(Star):
             file_info = await self._find_file_by_name(event, filename)
 
             if not file_info:
-                await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到名为「{filename}」的文件。请检查后台INFO日志获取详细查找过程。")]))
+                await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到名为「{filename}」的文件。")]))
                 return
 
-            file_id = file_info.get("file_id")
-            if not file_id:
-                await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{filename}」，但无法获取其ID，删除失败。")]))
+            file_id_to_delete = file_info.get("file_id")
+            found_filename = file_info.get("file_name")
+
+            if not file_id_to_delete:
+                await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{found_filename}」，但无法获取其ID，删除失败。")]))
                 return
             
-            logger.info(f"[{group_id}] 找到文件 '{filename}', File ID: {file_id}。准备删除...")
-            
-            # 暂时注释掉删除逻辑，专注于调试查找功能
-            # await self._perform_delete(event, file_id, filename) 
-            await event.send(MessageChain([Comp.Plain(f"调试：已成功找到文件「{filename}」，下一步将执行删除。")]))
+            logger.info(f"[{group_id}] 找到文件 '{found_filename}', File ID: {file_id_to_delete}。准备执行删除...")
+
+            assert isinstance(event, AiocqhttpMessageEvent)
+            client = event.bot
+            delete_result = await client.api.call_action(
+                'delete_group_file', group_id=group_id, file_id=file_id_to_delete
+            )
+            logger.info(f"[{group_id}] API响应: {delete_result}")
+
+            if delete_result and delete_result.get('retcode') == 0:
+                await event.send(MessageChain([Comp.Plain(f"✅ 文件「{found_filename}」已成功删除。")]))
+            else:
+                error_msg = delete_result.get('wording', 'API未返回成功状态')
+                await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{found_filename}」失败: {error_msg}")]))
 
         except Exception as e:
             logger.error(f"[{group_id}] 处理删除流程时发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
 
-    async def _find_file_by_name(self, event: AstrMessageEvent, filename: str) -> Optional[Dict]:
-        """在群文件的根目录和所有一级子目录中查找文件，并提供详细的INFO级日志。"""
+
+    async def _find_file_by_name(self, event: AstrMessageEvent, filename_to_find: str) -> Optional[Dict]:
+        """在群文件的根目录和所有一级子目录中查找文件，严格按无扩展名匹配。"""
         group_id = int(event.get_group_id())
-        logger.info(f"[{group_id}] --->>> 开始详细文件查找, 目标: '{filename}'")
+        logger.info(f"[{group_id}] --->>> 开始严格按无扩展名查找, 目标: '{filename_to_find}'")
         try:
-            assert isinstance(event, AiocqhttpMessageEvent)
             client = event.bot
 
             # 1. 查找根目录
-            logger.info(f"[{group_id}] [步骤1] 正在请求群文件根目录...")
             root_files_result = await client.api.call_action('get_group_root_files', group_id=group_id)
-            
-            # --- 关键日志 ---
-            logger.info(f"[{group_id}] [步骤1] 根目录API响应: {root_files_result}")
-
             if root_files_result and root_files_result.get('files'):
-                root_file_names = [f.get('file_name') for f in root_files_result['files']]
-                logger.info(f"[{group_id}] [步骤1] 在根目录找到 {len(root_file_names)} 个文件: {root_file_names}")
-
                 for file_info in root_files_result['files']:
                     current_filename = file_info.get('file_name')
-                    if current_filename == filename:
-                        logger.info(f"[{group_id}] [成功] 在根目录找到匹配文件: '{filename}'")
+                    # --- 关键修改：只比较去掉扩展名之后的部分 ---
+                    base_name, _ = os.path.splitext(current_filename)
+                    if base_name == filename_to_find:
+                        logger.info(f"[{group_id}] [成功] 在根目录找到匹配文件: '{current_filename}'")
                         return file_info
-            else:
-                logger.info(f"[{group_id}] [步骤1] 根目录中没有文件或API未返回文件列表。")
 
             # 2. 查找一级子目录
             if root_files_result and root_files_result.get('folders'):
-                folders = root_files_result['folders']
-                folder_names = [f.get('folder_name') for f in folders]
-                logger.info(f"[{group_id}] [步骤2] 在根目录找到 {len(folder_names)} 个文件夹: {folder_names}，准备进入...")
-                
-                for folder in folders:
+                for folder in root_files_result['folders']:
                     folder_id = folder.get('folder_id')
                     folder_name = folder.get('folder_name')
                     if not folder_id: continue
                     
-                    logger.info(f"[{group_id}] [步骤2] ---> 正在进入文件夹 '{folder_name}'...")
                     sub_files_result = await client.api.call_action(
                         'get_group_files_by_folder', group_id=group_id, folder_id=folder_id
                     )
-                    # --- 关键日志 ---
-                    logger.info(f"[{group_id}] [步骤2] 文件夹 '{folder_name}' 的API响应: {sub_files_result}")
-
                     if sub_files_result and sub_files_result.get('files'):
-                        sub_file_names = [f.get('file_name') for f in sub_files_result['files']]
-                        logger.info(f"[{group_id}] [步骤2] 在 '{folder_name}' 中找到 {len(sub_file_names)} 个文件: {sub_file_names}")
-                        
                         for file_info in sub_files_result['files']:
                             current_filename = file_info.get('file_name')
-                            if current_filename == filename:
-                                logger.info(f"[{group_id}] [成功] 在文件夹 '{folder_name}' 中找到匹配文件: '{filename}'")
+                            # --- 关键修改：只比较去掉扩展名之后的部分 ---
+                            base_name, _ = os.path.splitext(current_filename)
+                            if base_name == filename_to_find:
+                                logger.info(f"[{group_id}] [成功] 在文件夹 '{folder_name}' 中找到匹配文件: '{current_filename}'")
                                 return file_info
-                    else:
-                         logger.info(f"[{group_id}] [步骤2] 文件夹 '{folder_name}' 中没有文件或API未返回文件列表。")
-            else:
-                logger.info(f"[{group_id}] [步骤2] 根目录中没有文件夹。")
-
-            logger.warning(f"[{group_id}] [失败] <<<--- 遍历完所有位置，未能找到目标文件: '{filename}'")
+            
+            logger.warning(f"[{group_id}] [失败] <<<--- 遍历完所有位置，未能找到目标文件: '{filename_to_find}'")
             return None
         except Exception as e:
             logger.error(f"[{group_id}] 查找文件时发生API异常: {e}", exc_info=True)
