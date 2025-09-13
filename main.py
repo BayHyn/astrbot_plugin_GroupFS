@@ -1,7 +1,7 @@
 # astrbot_plugin_GroupFS/main.py
 
 import asyncio
-import os # 用于处理文件路径和扩展名
+import os
 from typing import List, Dict, Optional
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -72,10 +72,19 @@ class GroupFSPlugin(Star):
             )
             logger.info(f"[{group_id}] API响应: {delete_result}")
 
-            if delete_result and delete_result.get('retcode') == 0:
+            # --- ここが修正点です ---
+            # 修正对API响应的判断逻辑，以正确解析嵌套的JSON
+            is_success = False
+            if delete_result:
+                trans_result = delete_result.get('transGroupFileResult', {})
+                result_obj = trans_result.get('result', {})
+                if result_obj.get('retCode') == 0:
+                    is_success = True
+
+            if is_success:
                 await event.send(MessageChain([Comp.Plain(f"✅ 文件「{found_filename}」已成功删除。")]))
             else:
-                error_msg = delete_result.get('wording', 'API未返回成功状态')
+                error_msg = delete_result.get('wording', 'API未返回成功状态或格式未知')
                 await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{found_filename}」失败: {error_msg}")]))
 
         except Exception as e:
@@ -90,18 +99,15 @@ class GroupFSPlugin(Star):
         try:
             client = event.bot
 
-            # 1. 查找根目录
             root_files_result = await client.api.call_action('get_group_root_files', group_id=group_id)
             if root_files_result and root_files_result.get('files'):
                 for file_info in root_files_result['files']:
                     current_filename = file_info.get('file_name')
-                    # --- 关键修改：只比较去掉扩展名之后的部分 ---
                     base_name, _ = os.path.splitext(current_filename)
                     if base_name == filename_to_find:
                         logger.info(f"[{group_id}] [成功] 在根目录找到匹配文件: '{current_filename}'")
                         return file_info
 
-            # 2. 查找一级子目录
             if root_files_result and root_files_result.get('folders'):
                 for folder in root_files_result['folders']:
                     folder_id = folder.get('folder_id')
@@ -114,7 +120,6 @@ class GroupFSPlugin(Star):
                     if sub_files_result and sub_files_result.get('files'):
                         for file_info in sub_files_result['files']:
                             current_filename = file_info.get('file_name')
-                            # --- 关键修改：只比较去掉扩展名之后的部分 ---
                             base_name, _ = os.path.splitext(current_filename)
                             if base_name == filename_to_find:
                                 logger.info(f"[{group_id}] [成功] 在文件夹 '{folder_name}' 中找到匹配文件: '{current_filename}'")
