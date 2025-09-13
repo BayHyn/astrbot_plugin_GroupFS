@@ -25,24 +25,18 @@ class GroupFSPlugin(Star):
         logger.info(f"生效群组: {self.group_whitelist if self.group_whitelist else '所有群'}")
         logger.info(f"管理员: {self.admin_users}")
 
+    # --- ここが修正点です ---
+    # 严格按照文档规范定义函数签名
     @filter.command("df")
-    async def on_delete_file_command(self, event: AstrMessageEvent, *args, **kwargs):
+    async def on_delete_file_command(self, event: AstrMessageEvent, filename: str | None = None):
         """
         处理 /df <文件名> 指令。
-        使用通用的 *args, **kwargs 签名来兼容框架的调用方式。
+        'filename' 参数由 astrbot 框架自动从指令中解析并注入。
         """
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         
-        # --- ここが修正点です ---
-        # 从 args 或 kwargs 中安全地提取 filename
-        filename = None
-        if args:
-            filename = str(args[0])
-        elif 'filename' in kwargs:
-            filename = str(kwargs['filename'])
-        
-        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 解析参数为: '{filename}'")
+        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 框架注入参数为: '{filename}'")
 
         if self.group_whitelist and group_id not in self.group_whitelist:
             return
@@ -57,7 +51,6 @@ class GroupFSPlugin(Star):
             await event.send("❓ 请提供要删除的文件名。用法: /df <文件名>")
             return
         
-        # --- 流程代码不变 ---
         try:
             logger.info(f"[{group_id}] 流程开始，目标文件: '{filename}'")
             await event.send(f"正在查找文件「{filename}」，请稍候...")
