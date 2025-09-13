@@ -1,9 +1,55 @@
-# helloworld
+# GroupFS for AstrBot - QQ群文件管理插件
 
-AstrBot 插件模板
+![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
+![AstrBot](https://img.shields.io/badge/framework-AstrBot-orange)
 
-A template plugin for AstrBot plugin feature
+一款为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 设计的强大QQ群文件管理插件，旨在简化和自动化群组的文件维护工作。
 
-# 支持
+## ✨ 功能特色
 
-[帮助文档](https://astrbot.app)
+### ✓ 已实现功能
+
+* **文件删除**:
+    * 使用 `/df [文件名称]` 指令，授权管理员可以快速删除群文件。
+    * 采用**无后缀名优先匹配**逻辑，输入文件名时无需包含 `.txt`, `.zip` 等后缀名，查找更方便。
+
+### 🚀 未来计划
+
+* **存储空间预警**:
+    * 自动监测群文件的总大小，当存储空间逼近或达到上限时，主动向管理员发送通知，避免因空间不足导致无法上传。
+
+* **失效文件扫描**:
+    * 定期扫描群组内所有文件，自动检测并报告那些已失效（无法下载）的文件，方便群管理员及时清理。
+
+* **重复文件检测**:
+    * 智能分析文件内容（例如通过 Hash 校验），找出群内重复上传的文件，并提供清理建议，有效节省宝贵的群空间。
+
+## 💿 安装
+
+1.  下载本插件的完整文件夹 `astrbot_plugin_groupfs`。
+2.  将整个文件夹放入您 AstrBot 的 `data/plugins/` 目录下。
+3.  **彻底重启**您的 AstrBot 主程序（例如使用 `docker restart` 或重新执行启动命令），以确保插件被正确加载。
+
+## ⚙️ 配置
+
+插件的配置项定义在 `_conf_schema.json` 文件中，您可以在 AstrBot 的管理后台方便地进行图形化配置。
+
+| 配置项          | 类型   | 描述                                                                                              |
+| :-------------- | :----- | :------------------------------------------------------------------------------------------------ |
+| `group_whitelist` | `list` | **群组白名单**。插件只会在列表中的群组生效。若留空，则对所有群组生效。                              |
+| `admin_users`   | `list` | **管理员QQ列表**。只有在此列表中的用户才有权限使用 `/df` 等管理指令。**为了安全，强烈建议配置此项！** |
+
+#### 配置示例：
+
+```json
+{
+    "group_whitelist": [
+      123456789,
+      987654321
+    ],
+    "admin_users": [
+      10001,
+      10002
+    ]
+}
