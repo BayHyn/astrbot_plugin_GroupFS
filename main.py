@@ -26,17 +26,28 @@ class GroupFSPlugin(Star):
         logger.info(f"管理员: {self.admin_users}")
 
     # --- ここが修正点です ---
-    # 严格按照文档规范定义函数签名
+    # 完全模仿 bt 插件的指令处理方式
     @filter.command("df")
-    async def on_delete_file_command(self, event: AstrMessageEvent, filename: str | None = None):
+    async def on_delete_file_command(self, event: AstrMessageEvent):
         """
         处理 /df <文件名> 指令。
-        'filename' 参数由 astrbot 框架自动从指令中解析并注入。
+        采用手动解析 event.message_str 的方式获取参数。
         """
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         
-        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 框架注入参数为: '{filename}'")
+        # 手动分割指令和参数
+        command_parts = event.message_str.split(maxsplit=1)
+        
+        # 检查参数是否存在
+        if len(command_parts) < 2 or not command_parts[1]:
+            logger.warning(f"[{group_id}] 指令 /df 未提供文件名。")
+            await event.send("❓ 请提供要删除的文件名。用法: /df <文件名>")
+            return
+            
+        filename = command_parts[1]
+        
+        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 手动解析参数为: '{filename}'")
 
         if self.group_whitelist and group_id not in self.group_whitelist:
             return
@@ -44,11 +55,6 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             logger.warning(f"[{group_id}] 无权限用户 {user_id} 尝试删除。")
             await event.send("⚠️ 您没有执行此操作的权限。")
-            return
-
-        if not filename:
-            logger.warning(f"[{group_id}] 指令 /df 未提供文件名。")
-            await event.send("❓ 请提供要删除的文件名。用法: /df <文件名>")
             return
         
         try:
