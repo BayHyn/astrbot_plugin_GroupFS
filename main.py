@@ -5,13 +5,16 @@ import os
 import datetime
 from typing import List, Dict, Optional
 
+import aiohttp
+import chardet
+
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
-# --- 辅助函数：格式化文件大小 ---
+# --- 辅助函数 (保持不变) ---
 def _format_bytes(size: int) -> str:
     if size is None: return "未知大小"
     power = 1024
@@ -22,17 +25,22 @@ def _format_bytes(size: int) -> str:
         n += 1
     return f"{size:.2f} {power_labels[n]}"
 
-# --- 辅助函数：格式化时间戳 ---
 def _format_timestamp(ts: int) -> str:
     if ts is None or ts == 0: return "未知时间"
     return datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 
+# --- 新增：定义支持预览的文件扩展名列表 ---
+SUPPORTED_PREVIEW_EXTENSIONS = (
+    '.txt', '.md', '.json', '.xml', '.html', '.css', 
+    '.js', '.py', '.java', '.c', '.cpp', '.h', '.hpp', 
+    '.go', '.rs', '.rb', '.php', '.log', '.ini', '.yml', '.yaml'
+)
 
 @register(
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.2", # 版本提升
+    "0.3", # 版本提升
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -42,16 +50,11 @@ class GroupFSPlugin(Star):
         self.config = config if config else {}
         self.group_whitelist: List[int] = [int(g) for g in self.config.get("group_whitelist", [])]
         self.admin_users: List[int] = [int(u) for u in self.config.get("admin_users", [])]
+        self.preview_length: int = self.config.get("preview_length", 300)
         logger.info("插件 [群文件系统GroupFS] 已加载。")
 
-    # --- 新增：统一的结果格式化函数 ---
-    def _format_search_results(self, files: List[Dict], search_term: str, for_delete: bool = False) -> str:
-        """
-        将文件列表格式化为带详细信息的文本。
-        :param files: 文件信息字典的列表。
-        :param search_term: 用户原始的搜索词。
-        :param for_delete: 如果为True，末尾的提示语将侧重于删除。
-        """
+    def _format_search_results(self, files: List[Dict], search_term: str) -> str:
+        # ... (代码不变)
         reply_text = f"🔍 找到了 {len(files)} 个与「{search_term}」相关的结果：\n"
         reply_text += "-" * 20
         for i, file_info in enumerate(files, 1):
@@ -62,71 +65,71 @@ class GroupFSPlugin(Star):
                 f"\n  修改时间: {_format_timestamp(file_info.get('modify_time'))}"
             )
         reply_text += "\n" + "-" * 20
-        
-        if for_delete:
-            reply_text += f"\n请使用 /df {search_term} [序号] 来删除指定文件。"
-        else:
-            reply_text += f"\n如需删除，请使用 /df {search_term} [序号]"
-            
+        reply_text += f"\n如需预览，请使用 /sf {search_term} [序号]"
         return reply_text
 
-    # --- /sf 指令现在调用新函数 ---
     @filter.command("sf")
     async def on_search_file_command(self, event: AstrMessageEvent):
+        # ... (代码不变)
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
-        
-        command_parts = event.message_str.split(maxsplit=1)
-        
+        command_parts = event.message_str.split(maxsplit=2)
         if len(command_parts) < 2 or not command_parts[1]:
-            await event.send(MessageChain([Comp.Plain("❓ 请提供要搜索的文件名。用法: /sf <文件名>")]))
+            await event.send(MessageChain([Comp.Plain("❓ 请提供要搜索的文件名。用法: /sf <文件名> [序号]")]))
             return
-            
         filename_to_find = command_parts[1]
-        logger.info(f"[{group_id}] 用户 {user_id} 触发搜索指令 /sf, 目标: '{filename_to_find}'")
-
-        if self.group_whitelist and group_id not in self.group_whitelist:
-            return
-
-        await event.send(MessageChain([Comp.Plain(f"正在搜索包含「{filename_to_find}」的文件，请稍候...")]))
-        
+        index_str = command_parts[2] if len(command_parts) > 2 else None
+        logger.info(f"[{group_id}] 用户 {user_id} 触发 /sf, 目标: '{filename_to_find}', 序号: {index_str}")
+        await event.send(MessageChain([Comp.Plain(f"正在处理「{filename_to_find}」的请求，请稍候...")]))
         found_files = await self._find_all_matching_files(event, filename_to_find)
-
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到与「{filename_to_find}」相关的任何文件。")]))
             return
-        
-        # 直接调用格式化函数
-        reply_text = self._format_search_results(found_files, filename_to_find)
-        await event.send(MessageChain([Comp.Plain(reply_text)]))
+        if not index_str:
+            reply_text = self._format_search_results(found_files, filename_to_find)
+            await event.send(MessageChain([Comp.Plain(reply_text)]))
+            return
+        try:
+            index = int(index_str)
+            if not (1 <= index <= len(found_files)):
+                await event.send(MessageChain([Comp.Plain(f"❌ 序号错误！找到了 {len(found_files)} 个文件，请输入 1 到 {len(found_files)} 之间的数字。")]))
+                return
+            file_to_preview = found_files[index - 1]
+            preview_text, error_msg = await self._get_file_preview(event, file_to_preview)
+            if error_msg:
+                await event.send(MessageChain([Comp.Plain(error_msg)]))
+                return
+            reply_text = (
+                f"📄 文件「{file_to_preview.get('file_name')}」内容预览：\n"
+                + "-" * 20 + "\n"
+                + preview_text
+            )
+            await event.send(MessageChain([Comp.Plain(reply_text)]))
+        except ValueError:
+            await event.send(MessageChain([Comp.Plain("❌ 序号必须是一个数字。")]))
+        except Exception as e:
+            logger.error(f"[{group_id}] 处理预览时发生未知异常: {e}", exc_info=True)
+            await event.send(MessageChain([Comp.Plain("❌ 预览文件时发生内部错误，请检查后台日志。")]))
 
-    # --- /df 指令现在也调用新函数 ---
     @filter.command("df")
     async def on_delete_file_command(self, event: AstrMessageEvent):
+        # ... (代码不变)
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
-        
         command_parts = event.message_str.split(maxsplit=2)
-        
         if len(command_parts) < 2 or not command_parts[1]:
             await event.send(MessageChain([Comp.Plain("❓ 请提供要删除的文件名。用法: /df <文件名> [序号]")]))
             return
-            
         filename_to_find = command_parts[1]
         index_str = command_parts[2] if len(command_parts) > 2 else None
-        
         logger.info(f"[{group_id}] 用户 {user_id} 触发删除指令 /df, 目标: '{filename_to_find}', 序号: {index_str}")
-
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-
         found_files = await self._find_all_matching_files(event, filename_to_find)
-
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未找到要删除的目标文件「{filename_to_find}」。")]))
             return
-
         file_to_delete = None
         if len(found_files) == 1 and not index_str:
             file_to_delete = found_files[0]
@@ -141,64 +144,107 @@ class GroupFSPlugin(Star):
             except ValueError:
                 await event.send(MessageChain([Comp.Plain("❌ 序号必须是一个数字。")]))
                 return
-        else: # 找到多个文件，但用户未提供序号
-            # 直接调用格式化函数，并告知它是用于删除场景
-            reply_text = self._format_search_results(found_files, filename_to_find, for_delete=True)
+        else:
+            reply_text = self._format_search_results(found_files, filename_to_find).replace("如需预览", "如需删除")
             await event.send(MessageChain([Comp.Plain(reply_text)]))
             return
-
         if not file_to_delete:
             await event.send(MessageChain([Comp.Plain("❌ 内部错误，未能确定要删除的文件。")]))
             return
-
         try:
-            # ... (后续删除逻辑与之前完全相同)
             file_id_to_delete = file_to_delete.get("file_id")
             found_filename = file_to_delete.get("file_name")
-
             if not file_id_to_delete:
                 await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{found_filename}」，但无法获取其ID，删除失败。")]))
                 return
-
             logger.info(f"[{group_id}] 确认删除文件 '{found_filename}', File ID: {file_id_to_delete}...")
-            
             client = event.bot
             delete_result = await client.api.call_action('delete_group_file', group_id=group_id, file_id=file_id_to_delete)
-            
             is_success = False
             if delete_result:
                 trans_result = delete_result.get('transGroupFileResult', {})
                 result_obj = trans_result.get('result', {})
                 if result_obj.get('retCode') == 0:
                     is_success = True
-
             if is_success:
                 await event.send(MessageChain([Comp.Plain(f"✅ 文件「{found_filename}」已成功删除。")]))
             else:
                 error_msg = delete_result.get('wording', 'API未返回成功状态')
                 await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{found_filename}」失败: {error_msg}")]))
-
         except Exception as e:
             logger.error(f"[{group_id}] 处理删除流程时发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
 
+    async def _get_file_preview(self, event: AstrMessageEvent, file_info: dict) -> tuple[str, str | None]:
+        group_id = int(event.get_group_id())
+        file_id = file_info.get("file_id")
+        file_name = file_info.get("file_name", "")
+        
+        # --- 关键修改：检查文件扩展名 ---
+        _, file_extension = os.path.splitext(file_name)
+        if file_extension.lower() not in SUPPORTED_PREVIEW_EXTENSIONS:
+            logger.warning(f"[{group_id}] 用户尝试预览不支持的文件类型: '{file_name}'")
+            return "", f"❌ 文件「{file_name}」不是支持的文本格式，无法预览。"
+        
+        logger.info(f"[{group_id}] 正在为文件 '{file_name}' (ID: {file_id}) 获取预览...")
+        
+        try:
+            # 1. 获取文件下载链接
+            client = event.bot
+            url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+            if not (url_result and url_result.get('url')):
+                logger.error(f"[{group_id}] 获取文件 '{file_name}' 下载链接失败: {url_result}")
+                return "", f"❌ 无法获取文件「{file_name}」的下载链接。"
+            
+            url = url_result['url']
+            logger.debug(f"[{group_id}] 获取到下载链接: {url}")
+
+            # 2. 下载文件开头内容
+            async with aiohttp.ClientSession() as session:
+                headers = {'Range': 'bytes=0-4095'} 
+                async with session.get(url, headers=headers, timeout=20) as resp:
+                    if resp.status != 200 and resp.status != 206:
+                        logger.error(f"[{group_id}] 下载文件 '{file_name}' 失败，状态码: {resp.status}")
+                        return "", f"❌ 下载文件「{file_name}」失败 (HTTP: {resp.status})。"
+                    content_bytes = await resp.read()
+
+            if not content_bytes:
+                return "（文件为空）", None
+
+            # 3. 检测编码并解码
+            detection = chardet.detect(content_bytes)
+            encoding = detection.get('encoding', 'utf-8') or 'utf-8'
+            logger.info(f"[{group_id}] 文件 '{file_name}' 检测到编码: {encoding} (置信度: {detection.get('confidence')})")
+
+            decoded_text = content_bytes.decode(encoding, errors='ignore').strip()
+            
+            # 4. 截断并返回
+            if len(decoded_text) > self.preview_length:
+                return decoded_text[:self.preview_length] + "...", None
+            return decoded_text, None
+
+        except asyncio.TimeoutError:
+            logger.error(f"[{group_id}] 下载文件 '{file_name}' 超时。")
+            return "", f"❌ 预览文件「{file_name}」超时。"
+        except Exception as e:
+            logger.error(f"[{group_id}] 获取文件 '{file_name}' 预览时发生异常: {e}", exc_info=True)
+            return "", f"❌ 预览文件「{file_name}」时发生内部错误。"
+
+
     async def _find_all_matching_files(self, event: AstrMessageEvent, filename_to_find: str) -> List[Dict]:
-        # ... (此函数与之前完全相同，保持不变)
+        # ... (代码不变)
         group_id = int(event.get_group_id())
         logger.info(f"[{group_id}] 开始遍历所有文件查找, 目标: '{filename_to_find}'")
-        
         matching_files = []
         try:
             client = event.bot
             root_files_result = await client.api.call_action('get_group_root_files', group_id=group_id)
-
             if root_files_result and root_files_result.get('files'):
                 for file_info in root_files_result['files']:
                     current_filename = file_info.get('file_name', '')
                     base_name, _ = os.path.splitext(current_filename)
                     if filename_to_find in base_name or filename_to_find in current_filename:
                         matching_files.append(file_info)
-
             if root_files_result and root_files_result.get('folders'):
                 for folder in root_files_result['folders']:
                     folder_id = folder.get('folder_id')
@@ -210,7 +256,6 @@ class GroupFSPlugin(Star):
                             base_name, _ = os.path.splitext(current_filename)
                             if filename_to_find in base_name or filename_to_find in current_filename:
                                 matching_files.append(file_info)
-            
             logger.info(f"[{group_id}] 查找结束，共找到 {len(matching_files)} 个匹配文件。")
             return matching_files
         except Exception as e:
