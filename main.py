@@ -11,8 +11,8 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import Aioc
 @register(
     "astrbot_plugin_GroupFS",
     "Foolllll",
-    "QQ群文件管理插件", # 描述优化
-    "0.1", # 版本更新
+    "管理QQ群文件",
+    "0.1",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -33,7 +33,8 @@ class GroupFSPlugin(Star):
         参数 'filename' 由 astrbot 框架从指令后自动提取并注入。
         """
         group_id = int(event.get_group_id())
-        user_id = int(event.get_user_id())
+        # --- ここが修正点です ---
+        user_id = int(event.get_sender_id()) # 使用 get_sender_id() 替换 get_user_id()
 
         logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 框架解析参数为: '{filename}'")
 
