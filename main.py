@@ -15,7 +15,7 @@ import astrbot.api.message_components as Comp
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
 
-# --- 輔助函數 ---
+
 def _format_bytes(size: int, target_unit=None) -> str:
     if size is None: return "未知大小"
     power = 1024
@@ -46,7 +46,7 @@ SUPPORTED_PREVIEW_EXTENSIONS = (
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.3", # 版本提升
+    "0.4",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -68,99 +68,52 @@ class GroupFSPlugin(Star):
                 }
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
-        logger.info(f"解析后的容量监控配置: {self.storage_limits}")
         logger.info("插件 [群文件系统GroupFS] 已加载。")
-
-    @filter.command("gfstatus")
-    async def on_status_command(self, event: AstrMessageEvent):
-        group_id = int(event.get_group_id())
-        logger.info(f"[{group_id}] /gfstatus 指令入口，调用核心检查函数...")
-        await self._check_storage_and_notify(event, is_manual_check=True)
-        logger.info(f"[{group_id}] /gfstatus 指令处理完毕。")
+        logger.info(f"容量监控配置: {self.storage_limits}")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_file_upload(self, event: AstrMessageEvent):
         has_file = any(isinstance(seg, Comp.File) for seg in event.get_messages())
         if has_file:
             group_id = int(event.get_group_id())
-            logger.info(f"[{group_id}] 检测到消息中包含文件组件。")
             logger.info(f"[{group_id}] 检测到文件上传事件，将在5秒后触发容量检查。")
             await asyncio.sleep(5) 
-            logger.info(f"[{group_id}] 5秒等待结束，开始调用核心检查函数...")
-            await self._check_storage_and_notify(event, is_manual_check=False)
-            logger.info(f"[{group_id}] 自动容量检查处理完毕。")
+            await self._check_storage_and_notify(event)
 
-    async def _check_storage_and_notify(self, event: AstrMessageEvent, is_manual_check: bool):
+    async def _check_storage_and_notify(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
-        logger.info(f"[{group_id}] 进入 _check_storage_and_notify, 模式: {'手动' if is_manual_check else '自动'}")
+        if group_id not in self.storage_limits:
+            return # 如果群未配置监控，则直接返回
+        
         try:
             client = event.bot
-            logger.info(f"[{group_id}] 准备调用 get_group_file_system_info API...")
             system_info = await client.api.call_action('get_group_file_system_info', group_id=group_id)
-            
-            logger.info(f"[{group_id}] 获取到群文件系统信息: {system_info}")
-
-            if not system_info:
-                logger.warning(f"[{group_id}] API未返回有效的系统信息。")
-                if is_manual_check: await event.send(MessageChain([Comp.Plain("❌ 无法获取群文件系统信息。")]))
-                return
+            if not system_info: return
 
             file_count = system_info.get('file_count', 0)
-            limit_count = system_info.get('limit_count', 0)
             used_space_bytes = system_info.get('used_space', 0)
-            total_space_bytes = system_info.get('total_space', 0)
-            logger.info(f"[{group_id}] 解析API数据: file_count={file_count}, used_space={used_space_bytes} bytes")
-            
             used_space_gb = float(_format_bytes(used_space_bytes, 'GB'))
-            total_space_gb = float(_format_bytes(total_space_bytes, 'GB'))
-            logger.info(f"[{group_id}] 转换为GB: used_space={used_space_gb:.2f} GB")
 
-            if is_manual_check:
-                logger.info(f"[{group_id}] 手动模式，准备发送状态报告...")
-                reply_text = (
-                    f"📊 当前群文件状态：\n"
-                    f"文件数量: {file_count} / {limit_count}\n"
-                    f"已用空间: {used_space_gb:.2f} GB / {total_space_gb:.2f} GB"
-                )
-                await event.send(MessageChain([Comp.Plain(reply_text)]))
-                logger.info(f"[{group_id}] 状态报告发送完毕。")
-                return
-
-            if group_id in self.storage_limits:
-                limits = self.storage_limits[group_id]
-                count_limit = limits['count_limit']
-                space_limit = limits['space_limit_gb']
-                logger.info(f"[{group_id}] 找到该群的监控配置: 数量上限={count_limit}, 空间上限={space_limit}GB")
-                
-                notifications = []
-                logger.info(f"[{group_id}] 检查数量: {file_count} >= {count_limit} ?")
-                if file_count >= count_limit:
-                    msg = f"文件数量已达 {file_count}，接近或超过设定的 {count_limit} 上限！"
-                    notifications.append(msg)
-                    logger.info(f"[{group_id}] 触发数量上限警告: {msg}")
-                
-                logger.info(f"[{group_id}] 检查空间: {used_space_gb:.2f} >= {space_limit:.2f} ?")
-                if used_space_gb >= space_limit:
-                    msg = f"已用空间已达 {used_space_gb:.2f}GB，接近或超过设定的 {space_limit:.2f}GB 上限！"
-                    notifications.append(msg)
-                    logger.info(f"[{group_id}] 触发空间上限警告: {msg}")
-                
-                if notifications:
-                    logger.info(f"[{group_id}] 准备发送 {len(notifications)} 条警告...")
-                    full_notification = "⚠️ **群文件容量警告** ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
-                    await event.send(MessageChain([Comp.Plain(full_notification)]))
-                    logger.info(f"[{group_id}] 容量警告发送完毕。")
-                else:
-                    logger.info(f"[{group_id}] 未达到任何阈值，不发送警告。")
-            else:
-                logger.info(f"[{group_id}] 未找到该群的监控配置，跳过自动检查。")
+            limits = self.storage_limits[group_id]
+            count_limit = limits['count_limit']
+            space_limit = limits['space_limit_gb']
+            
+            notifications = []
+            if file_count >= count_limit:
+                notifications.append(f"文件数量已达 {file_count}，接近或超过设定的 {count_limit} 上限！")
+            
+            if used_space_gb >= space_limit:
+                notifications.append(f"已用空间已达 {used_space_gb:.2f}GB，接近或超过设定的 {space_limit:.2f}GB 上限！")
+            
+            if notifications:
+                full_notification = "⚠️ 群文件容量警告 ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
+                logger.warning(f"[{group_id}] 发送容量超限警告: {full_notification}")
+                await event.send(MessageChain([Comp.Plain(full_notification)]))
 
         except ActionFailed as e:
             logger.error(f"[{group_id}] 调用 get_group_file_system_info 失败: {e}")
-            if is_manual_check: await event.send(MessageChain([Comp.Plain(f"❌ API调用失败: {e.wording}")]))
         except Exception as e:
             logger.error(f"[{group_id}] 处理容量检查时发生未知异常: {e}", exc_info=True)
-            if is_manual_check: await event.send(MessageChain([Comp.Plain("❌ 处理时发生内部错误，请检查后台日志。")]))
     
     def _format_search_results(self, files: List[Dict], search_term: str) -> str:
         reply_text = f"🔍 找到了 {len(files)} 个与「{search_term}」相关的结果：\n"
@@ -274,6 +227,7 @@ class GroupFSPlugin(Star):
                     is_success = True
             if is_success:
                 await event.send(MessageChain([Comp.Plain(f"✅ 文件「{found_filename}」已成功删除。")]))
+                logger.info(f"[{group_id}] 文件 '{found_filename}' 已成功删除。")
             else:
                 error_msg = delete_result.get('wording', 'API未返回成功状态')
                 await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{found_filename}」失败: {error_msg}")]))
@@ -297,7 +251,7 @@ class GroupFSPlugin(Star):
             if e.retcode == 1200 or '(-134)' in str(e.wording):
                 error_message = (
                     f"❌ 预览文件「{file_name}」失败：\n"
-                    f"该文件可能已失效或被服务器清理。\n"
+                    f"该文件可能已失效。\n"
                     f"建议使用 /df {os.path.splitext(file_name)[0]} 将其删除。"
                 )
                 return "", error_message
@@ -305,25 +259,19 @@ class GroupFSPlugin(Star):
                 return "", f"❌ 预览失败，API返回错误：{e.wording}"
         try:
             if not (url_result and url_result.get('url')):
-                logger.error(f"[{group_id}] 获取文件 '{file_name}' 下载链接失败: {url_result}")
                 return "", f"❌ 无法获取文件「{file_name}」的下载链接。"
             url = url_result['url']
-            logger.info(f"[{group_id}] 获取到下载链接: {url}")
             async with aiohttp.ClientSession() as session:
                 headers = {'Range': 'bytes=0-4095'} 
                 async with session.get(url, headers=headers, timeout=20) as resp:
-                    logger.info(f"[{group_id}] 下载文件 '{file_name}' 的HTTP响应状态码: {resp.status}")
                     if resp.status != 200 and resp.status != 206:
                         return "", f"❌ 下载文件「{file_name}」失败 (HTTP: {resp.status})。"
                     content_bytes = await resp.read()
-            logger.info(f"[{group_id}] 下载到 {len(content_bytes)} 字节的内容用于预览。")
             if not content_bytes:
                 return "（文件为空）", None
             detection = chardet.detect(content_bytes)
             encoding = detection.get('encoding', 'utf-8') or 'utf-8'
-            logger.info(f"[{group_id}] 文件 '{file_name}' 检测到编码: {encoding} (置信度: {detection.get('confidence')})")
             decoded_text = content_bytes.decode(encoding, errors='ignore').strip()
-            logger.info(f"[{group_id}] 解码后文本长度: {len(decoded_text)}")
             if len(decoded_text) > self.preview_length:
                 return decoded_text[:self.preview_length] + "...", None
             return decoded_text, None
@@ -339,30 +287,22 @@ class GroupFSPlugin(Star):
         matching_files = []
         try:
             client = event.bot
-            logger.info(f"[{group_id}] [查找] 正在请求根目录...")
             root_files_result = await client.api.call_action('get_group_root_files', group_id=group_id)
             if root_files_result and root_files_result.get('files'):
-                logger.info(f"[{group_id}] [查找] 根目录找到 {len(root_files_result['files'])} 个文件。")
                 for file_info in root_files_result['files']:
                     current_filename = file_info.get('file_name', '')
                     base_name, _ = os.path.splitext(current_filename)
-                    logger.info(f"[{group_id}] [查找] 检查根目录文件: '{current_filename}'")
                     if filename_to_find in base_name or filename_to_find in current_filename:
                         matching_files.append(file_info)
             if root_files_result and root_files_result.get('folders'):
-                logger.info(f"[{group_id}] [查找] 根目录找到 {len(root_files_result['folders'])} 个文件夹。")
                 for folder in root_files_result['folders']:
                     folder_id = folder.get('folder_id')
-                    folder_name = folder.get('folder_name')
                     if not folder_id: continue
-                    logger.info(f"[{group_id}] [查找] 进入文件夹 '{folder_name}'...")
                     sub_files_result = await client.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=folder_id)
                     if sub_files_result and sub_files_result.get('files'):
-                        logger.info(f"[{group_id}] [查找] 文件夹 '{folder_name}' 中找到 {len(sub_files_result['files'])} 个文件。")
                         for file_info in sub_files_result['files']:
                             current_filename = file_info.get('file_name', '')
                             base_name, _ = os.path.splitext(current_filename)
-                            logger.info(f"[{group_id}] [查找] 检查文件: '{current_filename}'")
                             if filename_to_find in base_name or filename_to_find in current_filename:
                                 matching_files.append(file_info)
             logger.info(f"[{group_id}] 查找结束，共找到 {len(matching_files)} 个匹配文件。")
