@@ -33,8 +33,7 @@ class GroupFSPlugin(Star):
         参数 'filename' 由 astrbot 框架从指令后自动提取并注入。
         """
         group_id = int(event.get_group_id())
-        # --- ここが修正点です ---
-        user_id = int(event.get_sender_id()) # 使用 get_sender_id() 替换 get_user_id()
+        user_id = int(event.get_sender_id())
 
         logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 框架解析参数为: '{filename}'")
 
@@ -56,6 +55,10 @@ class GroupFSPlugin(Star):
         
         # 4. 创建异步任务执行删除流程，避免阻塞
         asyncio.create_task(self._handle_delete_flow(event, filename))
+        
+        # --- ここが修正点です ---
+        # 5. 停止事件继续传播，防止被其他插件（如AI Agent）处理
+        event.stop_event()
 
     async def _handle_delete_flow(self, event: AstrMessageEvent, filename: str):
         """完整的删除流程：查找文件 -> 执行删除"""
