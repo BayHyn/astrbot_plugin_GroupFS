@@ -13,6 +13,8 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+# --- 新增导入：用于捕获API失败异常 ---
+from aiocqhttp.exceptions import ActionFailed
 
 # --- 辅助函数 (保持不变) ---
 def _format_bytes(size: int) -> str:
@@ -29,7 +31,6 @@ def _format_timestamp(ts: int) -> str:
     if ts is None or ts == 0: return "未知时间"
     return datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 
-# --- 新增：定义支持预览的文件扩展名列表 ---
 SUPPORTED_PREVIEW_EXTENSIONS = (
     '.txt', '.md', '.json', '.xml', '.html', '.css', 
     '.js', '.py', '.java', '.c', '.cpp', '.h', '.hpp', 
@@ -180,54 +181,59 @@ class GroupFSPlugin(Star):
         file_id = file_info.get("file_id")
         file_name = file_info.get("file_name", "")
         
-        # --- 关键修改：检查文件扩展名 ---
         _, file_extension = os.path.splitext(file_name)
         if file_extension.lower() not in SUPPORTED_PREVIEW_EXTENSIONS:
-            logger.warning(f"[{group_id}] 用户尝试预览不支持的文件类型: '{file_name}'")
             return "", f"❌ 文件「{file_name}」不是支持的文本格式，无法预览。"
         
         logger.info(f"[{group_id}] 正在为文件 '{file_name}' (ID: {file_id}) 获取预览...")
         
         try:
-            # 1. 获取文件下载链接
             client = event.bot
             url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+            # (后续下载逻辑...)
+
+        # --- 关键修改：捕获并处理文件失效的特定错误 ---
+        except ActionFailed as e:
+            logger.warning(f"[{group_id}] 获取文件 '{file_name}' 下载链接时API调用失败: {e}")
+            if e.retcode == 1200 or '(-134)' in str(e.wording):
+                error_message = (
+                    f"❌ 预览文件「{file_name}」失败：\n"
+                    f"该文件可能已失效或被服务器清理。\n"
+                    f"建议使用 /df {os.path.splitext(file_name)[0]} 将其删除。"
+                )
+                return "", error_message
+            else:
+                return "", f"❌ 预览失败，API返回错误：{e.wording}"
+        
+        # --- 原有代码继续处理其他异常和正常流程 ---
+        try:
             if not (url_result and url_result.get('url')):
                 logger.error(f"[{group_id}] 获取文件 '{file_name}' 下载链接失败: {url_result}")
                 return "", f"❌ 无法获取文件「{file_name}」的下载链接。"
             
             url = url_result['url']
-            logger.debug(f"[{group_id}] 获取到下载链接: {url}")
-
-            # 2. 下载文件开头内容
             async with aiohttp.ClientSession() as session:
                 headers = {'Range': 'bytes=0-4095'} 
                 async with session.get(url, headers=headers, timeout=20) as resp:
                     if resp.status != 200 and resp.status != 206:
-                        logger.error(f"[{group_id}] 下载文件 '{file_name}' 失败，状态码: {resp.status}")
                         return "", f"❌ 下载文件「{file_name}」失败 (HTTP: {resp.status})。"
                     content_bytes = await resp.read()
 
             if not content_bytes:
                 return "（文件为空）", None
 
-            # 3. 检测编码并解码
             detection = chardet.detect(content_bytes)
             encoding = detection.get('encoding', 'utf-8') or 'utf-8'
-            logger.info(f"[{group_id}] 文件 '{file_name}' 检测到编码: {encoding} (置信度: {detection.get('confidence')})")
-
             decoded_text = content_bytes.decode(encoding, errors='ignore').strip()
             
-            # 4. 截断并返回
             if len(decoded_text) > self.preview_length:
                 return decoded_text[:self.preview_length] + "...", None
             return decoded_text, None
 
         except asyncio.TimeoutError:
-            logger.error(f"[{group_id}] 下载文件 '{file_name}' 超时。")
             return "", f"❌ 预览文件「{file_name}」超时。"
         except Exception as e:
-            logger.error(f"[{group_id}] 获取文件 '{file_name}' 预览时发生异常: {e}", exc_info=True)
+            logger.error(f"[{group_id}] 获取文件 '{file_name}' 预览时发生未知异常: {e}", exc_info=True)
             return "", f"❌ 预览文件「{file_name}」时发生内部错误。"
 
 
