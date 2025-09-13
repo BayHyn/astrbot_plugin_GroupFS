@@ -4,10 +4,11 @@ import asyncio
 from typing import List, Dict, Optional
 
 # --- ここが修正点です ---
-from astrbot.api.event import filter, AstrMessageEvent
+# 严格按照 file_checker 范例的导入方式
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from astrbot.api.message_components import Plain, MessageChain # 导入必要的组件
+import astrbot.api.message_components as Comp # 使用 'as Comp' 别名
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 @register(
@@ -32,39 +33,33 @@ class GroupFSPlugin(Star):
         
         command_parts = event.message_str.split(maxsplit=1)
         
-        # --- 所有的 event.send 都需要用 MessageChain 包装 ---
         if len(command_parts) < 2 or not command_parts[1]:
-            logger.warning(f"[{group_id}] 指令 /df 未提供文件名。")
-            await event.send(MessageChain([Plain("❓ 请提供要删除的文件名。用法: /df <文件名>")]))
+            await event.send(MessageChain([Comp.Plain("❓ 请提供要删除的文件名。用法: /df <文件名>")]))
             return
             
         filename = command_parts[1]
         
-        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 手动解析参数为: '{filename}'")
+        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 参数为: '{filename}'")
 
         if self.group_whitelist and group_id not in self.group_whitelist:
             return
 
         if user_id not in self.admin_users:
-            logger.warning(f"[{group_id}] 无权限用户 {user_id} 尝试删除。")
-            await event.send(MessageChain([Plain("⚠️ 您没有执行此操作的权限。")]))
+            await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
         
         try:
-            logger.info(f"[{group_id}] 流程开始，目标文件: '{filename}'")
-            await event.send(MessageChain([Plain(f"正在查找文件「{filename}」，请稍候...")]))
+            await event.send(MessageChain([Comp.Plain(f"正在查找文件「{filename}」，请稍候...")]))
 
             file_info = await self._find_file_by_name(event, filename)
 
             if not file_info:
-                logger.warning(f"[{group_id}] 未找到文件: '{filename}'")
-                await event.send(MessageChain([Plain(f"❌ 未在群文件中找到名为「{filename}」的文件。")]))
+                await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到名为「{filename}」的文件。")]))
                 return
 
             file_id = file_info.get("file_id")
             if not file_id:
-                logger.error(f"[{group_id}] 找到文件但缺少file_id: {file_info}")
-                await event.send(MessageChain([Plain(f"❌ 找到文件「{filename}」，但无法获取其ID，删除失败。")]))
+                await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{filename}」，但无法获取其ID，删除失败。")]))
                 return
             
             logger.info(f"[{group_id}] 找到文件 '{filename}', File ID: {file_id}。准备删除...")
@@ -78,16 +73,14 @@ class GroupFSPlugin(Star):
             logger.info(f"[{group_id}] API响应: {delete_result}")
 
             if delete_result and delete_result.get('retcode') == 0:
-                logger.info(f"[{group_id}] 成功删除文件: '{filename}'")
-                await event.send(MessageChain([Plain(f"✅ 文件「{filename}」已成功删除。")]))
+                await event.send(MessageChain([Comp.Plain(f"✅ 文件「{filename}」已成功删除。")]))
             else:
                 error_msg = delete_result.get('wording', 'API未返回成功状态')
-                logger.error(f"[{group_id}] API调用失败: {error_msg}")
-                await event.send(MessageChain([Plain(f"❌ 删除文件「{filename}」失败: {error_msg}")]))
+                await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{filename}」失败: {error_msg}")]))
 
         except Exception as e:
             logger.error(f"[{group_id}] 处理删除流程时发生未知异常: {e}", exc_info=True)
-            await event.send(MessageChain([Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
+            await event.send(MessageChain([Comp.Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
 
     async def _find_file_by_name(self, event: AstrMessageEvent, filename: str) -> Optional[Dict]:
         group_id = int(event.get_group_id())
@@ -96,19 +89,15 @@ class GroupFSPlugin(Star):
             assert isinstance(event, AiocqhttpMessageEvent)
             client = event.bot
 
-            logger.debug(f"[{group_id}] 正在扫描根目录...")
             root_files_result = await client.api.call_action('get_group_root_files', group_id=group_id)
             if root_files_result and root_files_result.get('files'):
                 for file_info in root_files_result['files']:
                     if file_info.get('file_name') == filename:
-                        logger.info(f"[{group_id}] 在根目录找到文件。")
                         return file_info
 
             if root_files_result and root_files_result.get('folders'):
-                logger.debug(f"[{group_id}] 正在扫描 {len(root_files_result['folders'])} 个一级子目录...")
                 for folder in root_files_result['folders']:
                     folder_id = folder.get('folder_id')
-                    folder_name = folder.get('folder_name')
                     if not folder_id: continue
                     
                     sub_files_result = await client.api.call_action(
@@ -117,10 +106,8 @@ class GroupFSPlugin(Star):
                     if sub_files_result and sub_files_result.get('files'):
                         for file_info in sub_files_result['files']:
                             if file_info.get('file_name') == filename:
-                                logger.info(f"[{group_id}] 在文件夹 '{folder_name}' 中找到文件。")
                                 return file_info
             
-            logger.warning(f"[{group_id}] 扫描完所有位置，未找到文件。")
             return None
         except Exception as e:
             logger.error(f"[{group_id}] 查找文件时发生API异常: {e}", exc_info=True)
