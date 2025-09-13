@@ -26,15 +26,23 @@ class GroupFSPlugin(Star):
         logger.info(f"管理员: {self.admin_users}")
 
     @filter.command("df")
-    async def on_delete_file_command(self, event: AstrMessageEvent, filename: str | None = None):
+    async def on_delete_file_command(self, event: AstrMessageEvent, *args, **kwargs):
         """
         处理 /df <文件名> 指令。
-        所有操作在本函数内直接 await，不再创建后台任务。
+        使用通用的 *args, **kwargs 签名来兼容框架的调用方式。
         """
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
-
-        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 参数: '{filename}'")
+        
+        # --- ここが修正点です ---
+        # 从 args 或 kwargs 中安全地提取 filename
+        filename = None
+        if args:
+            filename = str(args[0])
+        elif 'filename' in kwargs:
+            filename = str(kwargs['filename'])
+        
+        logger.info(f"[{group_id}] 用户 {user_id} 触发指令 /df, 解析参数为: '{filename}'")
 
         if self.group_whitelist and group_id not in self.group_whitelist:
             return
@@ -49,7 +57,7 @@ class GroupFSPlugin(Star):
             await event.send("❓ 请提供要删除的文件名。用法: /df <文件名>")
             return
         
-        # --- 直接在本函数内执行所有流程 ---
+        # --- 流程代码不变 ---
         try:
             logger.info(f"[{group_id}] 流程开始，目标文件: '{filename}'")
             await event.send(f"正在查找文件「{filename}」，请稍候...")
@@ -73,9 +81,7 @@ class GroupFSPlugin(Star):
             client = event.bot
             
             delete_result = await client.api.call_action(
-                'delete_group_file', 
-                group_id=group_id, 
-                file_id=file_id
+                'delete_group_file', group_id=group_id, file_id=file_id
             )
             logger.info(f"[{group_id}] API响应: {delete_result}")
 
