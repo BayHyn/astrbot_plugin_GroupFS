@@ -3,9 +3,11 @@
 import asyncio
 from typing import List, Dict, Optional
 
+# --- ここが修正点です ---
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.api.message_components import Plain, MessageChain # 导入必要的组件
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 @register(
@@ -22,27 +24,18 @@ class GroupFSPlugin(Star):
         self.group_whitelist: List[int] = [int(g) for g in self.config.get("group_whitelist", [])]
         self.admin_users: List[int] = [int(u) for u in self.config.get("admin_users", [])]
         logger.info("插件 [群文件系统GroupFS] 已加载。")
-        logger.info(f"生效群组: {self.group_whitelist if self.group_whitelist else '所有群'}")
-        logger.info(f"管理员: {self.admin_users}")
 
-    # --- ここが修正点です ---
-    # 完全模仿 bt 插件的指令处理方式
     @filter.command("df")
     async def on_delete_file_command(self, event: AstrMessageEvent):
-        """
-        处理 /df <文件名> 指令。
-        采用手动解析 event.message_str 的方式获取参数。
-        """
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         
-        # 手动分割指令和参数
         command_parts = event.message_str.split(maxsplit=1)
         
-        # 检查参数是否存在
+        # --- 所有的 event.send 都需要用 MessageChain 包装 ---
         if len(command_parts) < 2 or not command_parts[1]:
             logger.warning(f"[{group_id}] 指令 /df 未提供文件名。")
-            await event.send("❓ 请提供要删除的文件名。用法: /df <文件名>")
+            await event.send(MessageChain([Plain("❓ 请提供要删除的文件名。用法: /df <文件名>")]))
             return
             
         filename = command_parts[1]
@@ -54,24 +47,24 @@ class GroupFSPlugin(Star):
 
         if user_id not in self.admin_users:
             logger.warning(f"[{group_id}] 无权限用户 {user_id} 尝试删除。")
-            await event.send("⚠️ 您没有执行此操作的权限。")
+            await event.send(MessageChain([Plain("⚠️ 您没有执行此操作的权限。")]))
             return
         
         try:
             logger.info(f"[{group_id}] 流程开始，目标文件: '{filename}'")
-            await event.send(f"正在查找文件「{filename}」，请稍候...")
+            await event.send(MessageChain([Plain(f"正在查找文件「{filename}」，请稍候...")]))
 
             file_info = await self._find_file_by_name(event, filename)
 
             if not file_info:
                 logger.warning(f"[{group_id}] 未找到文件: '{filename}'")
-                await event.send(f"❌ 未在群文件中找到名为「{filename}」的文件。")
+                await event.send(MessageChain([Plain(f"❌ 未在群文件中找到名为「{filename}」的文件。")]))
                 return
 
             file_id = file_info.get("file_id")
             if not file_id:
                 logger.error(f"[{group_id}] 找到文件但缺少file_id: {file_info}")
-                await event.send(f"❌ 找到文件「{filename}」，但无法获取其ID，删除失败。")
+                await event.send(MessageChain([Plain(f"❌ 找到文件「{filename}」，但无法获取其ID，删除失败。")]))
                 return
             
             logger.info(f"[{group_id}] 找到文件 '{filename}', File ID: {file_id}。准备删除...")
@@ -86,18 +79,17 @@ class GroupFSPlugin(Star):
 
             if delete_result and delete_result.get('retcode') == 0:
                 logger.info(f"[{group_id}] 成功删除文件: '{filename}'")
-                await event.send(f"✅ 文件「{filename}」已成功删除。")
+                await event.send(MessageChain([Plain(f"✅ 文件「{filename}」已成功删除。")]))
             else:
                 error_msg = delete_result.get('wording', 'API未返回成功状态')
                 logger.error(f"[{group_id}] API调用失败: {error_msg}")
-                await event.send(f"❌ 删除文件「{filename}」失败: {error_msg}")
+                await event.send(MessageChain([Plain(f"❌ 删除文件「{filename}」失败: {error_msg}")]))
 
         except Exception as e:
             logger.error(f"[{group_id}] 处理删除流程时发生未知异常: {e}", exc_info=True)
-            await event.send(f"❌ 处理删除时发生内部错误，请检查后台日志。")
+            await event.send(MessageChain([Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
 
     async def _find_file_by_name(self, event: AstrMessageEvent, filename: str) -> Optional[Dict]:
-        """在群文件的根目录和所有一级子目录中查找文件。"""
         group_id = int(event.get_group_id())
         logger.info(f"[{group_id}] 开始在服务器上遍历查找 '{filename}'...")
         try:
