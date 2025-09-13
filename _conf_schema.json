@@ -1,0 +1,14 @@
+{
+    "group_whitelist": {
+        "description": "群聊白名单",
+        "hint": "仅在白名单里的群启用本插件功能，不填则表示所有群都启用。",
+        "type": "list",
+        "default": []
+    },
+    "admin_users": {
+        "description": "管理员QQ列表",
+        "hint": "只有在此列表中的用户才有权限使用 /df 等管理指令。为了安全，强烈建议配置此项！",
+        "type": "list",
+        "default": []
+    }
+}
