@@ -78,7 +78,7 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        await event.send(MessageChain([Comp.Plain("⚠️ **警告**：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
+        await event.send(MessageChain([Comp.Plain("⚠️ 警告：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
         asyncio.create_task(self._perform_batch_check_and_delete(event))
         event.stop_event()
 
@@ -248,7 +248,7 @@ class GroupFSPlugin(Star):
             if used_space_gb >= space_limit:
                 notifications.append(f"已用空间已达 {used_space_gb:.2f}GB，接近或超过设定的 {space_limit:.2f}GB 上限！")
             if notifications:
-                full_notification = "⚠️ **群文件容量警告** ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
+                full_notification = "⚠️ 群文件容量警告 ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
                 logger.warning(f"[{group_id}] 发送容量超限警告: {full_notification}")
                 await event.send(MessageChain([Comp.Plain(full_notification)]))
         except ActionFailed as e:
