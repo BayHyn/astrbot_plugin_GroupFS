@@ -24,7 +24,7 @@ from . import utils
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.6_debug", # 标记为调试版本
+    "0.6",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -39,6 +39,7 @@ class GroupFSPlugin(Star):
         self.last_cron_check_time: Dict[int, datetime.datetime] = {}
         self.bot = None
 
+        # 解析容量监控配置
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
@@ -51,6 +52,7 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         
+        # 解析定时任务配置
         cron_configs = self.config.get("scheduled_check_tasks", [])
         for item in cron_configs:
             try:
@@ -62,8 +64,8 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 scheduled_check_tasks 配置 '{item}' 时出错: {e}，已跳过。")
         
-        self.last_check_date: str = self.config.get("last_check_date", "")
         logger.info("插件 [群文件系统GroupFS] 已加载。")
+        logger.info(f"定时任务配置: {self.cron_tasks}")
 
     async def initialize(self):
         if self.cron_tasks:
@@ -93,60 +95,62 @@ class GroupFSPlugin(Star):
             bot = self.bot
             logger.info(f"[{group_id}] [定时任务] 开始获取全量文件列表...")
             all_files = await self._get_all_files_recursive_core(group_id, bot)
-            # ... (此处省略定时任务的核心逻辑，因为它与 /cf 的核心逻辑 _perform_batch_check 类似)
+            total_count = len(all_files)
+            logger.info(f"[{group_id}] [定时任务] 获取到 {total_count} 个文件，准备分批检查。")
+            invalid_files_info = []
+            batch_size = 50
+            for i in range(0, total_count, batch_size):
+                batch = all_files[i:i + batch_size]
+                for file_info in batch:
+                    file_id = file_info.get("file_id")
+                    if not file_id: continue
+                    try:
+                        await bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                    except ActionFailed as e:
+                        if e.result.get('retcode') == 1200:
+                            invalid_files_info.append(file_info)
+                    await asyncio.sleep(0.2)
+            if not invalid_files_info:
+                logger.info(f"[{group_id}] [定时任务] 检查完成，未发现失效文件。")
+                return 
+            report_message = f"🚨 定时检查报告\n在 {total_count} 个群文件中，共发现 {len(invalid_files_info)} 个失效文件：\n"
+            report_message += "-" * 20
+            for info in invalid_files_info:
+                folder_name = info.get('parent_folder_name', '未知')
+                modify_time = utils.format_timestamp(info.get('modify_time'))
+                report_message += f"\n- {info.get('file_name')}"
+                report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
+            report_message += "\n" + "-" * 20
+            report_message += "\n建议管理员使用 /cdf 指令进行一键清理。"
+            logger.info(f"[{group_id}] [定时任务] 检查全部完成，准备发送报告。")
+            await bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
         except Exception as e:
             logger.error(f"[{group_id}] [定时任务] 执行过程中发生未知异常: {e}", exc_info=True)
 
     async def _get_all_files_recursive_core(self, group_id: int, bot) -> List[Dict]:
         all_files = []
         folders_to_scan = [(None, "根目录")]
-        logger.info(f"[{group_id}] [递归查找] 开始获取文件列表...")
         while folders_to_scan:
             current_folder_id, current_folder_name = folders_to_scan.pop(0)
             try:
-                logger.info(f"[{group_id}] [递归查找] ==> 正在扫描文件夹: '{current_folder_name}' (ID: {current_folder_id})")
                 if current_folder_id is None:
                     result = await bot.api.call_action('get_group_root_files', group_id=group_id, file_count=2000)
                 else:
                     result = await bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id, file_count=2000)
-                
-                logger.info(f"[{group_id}] [递归查找] 文件夹 '{current_folder_name}' 的API原始响应: {result}")
-
-                if not result: 
-                    logger.warning(f"[{group_id}] [递归查找] 文件夹 '{current_folder_name}' 未返回任何结果。")
-                    continue
-
-                files_in_folder = result.get('files', [])
-                folders_in_folder = result.get('folders', [])
-                logger.info(f"[{group_id}] [递归查找] 在 '{current_folder_name}' 中找到 {len(files_in_folder)} 个文件 和 {len(folders_in_folder)} 个子文件夹。")
-
-                if files_in_folder:
-                    for file_info in files_in_folder:
+                if not result: continue
+                if result.get('files'):
+                    for file_info in result['files']:
                         file_info['parent_folder_name'] = current_folder_name
                         all_files.append(file_info)
-                if folders_in_folder:
-                    for folder in folders_in_folder:
+                if result.get('folders'):
+                    for folder in result['folders']:
                         if folder_id := folder.get('folder_id'):
                             folders_to_scan.append((folder_id, folder.get('folder_name')))
             except Exception as e:
-                logger.error(f"[{group_id}] 递归获取文件夹 '{current_folder_name}' 内容时出错: {e}", exc_info=True)
+                logger.error(f"[{group_id}] 递归获取文件夹 '{current_folder_name}' 内容时出错: {e}")
                 continue
-        logger.info(f"[{group_id}] [递归查找] 列表获取完成，共计 {len(all_files)} 个文件。")
         return all_files
-
-    async def _trigger_daily_check_if_needed(self, event: AstrMessageEvent):
-        today_str = datetime.date.today().isoformat()
-        if self.last_check_date != today_str:
-            group_id = int(event.get_group_id())
-            logger.info(f"[{group_id}] [每日自动检查] 检测到今日尚未检查，将自动启动一次失效文件扫描...")
-            self.last_check_date = today_str
-            self.config["last_check_date"] = today_str
-            try:
-                self.context.save_config()
-            except Exception:
-                logger.warning(f"[{group_id}] 当前 AstrBot 版本似乎不支持 context.save_config()，请手动保存配置以记录检查日期。")
-            asyncio.create_task(self._perform_batch_check(event, is_daily_check=True))
-
+    
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
         if not self.bot: self.bot = event.bot
@@ -155,14 +159,12 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        await self._trigger_daily_check_if_needed(event)
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
         await event.send(MessageChain([Comp.Plain("⚠️ 警告：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
         asyncio.create_task(self._perform_batch_check_and_delete(event))
         event.stop_event()
 
     async def _perform_batch_check_and_delete(self, event: AstrMessageEvent):
-        # ... (此函数保持不变)
         group_id = int(event.get_group_id())
         try:
             logger.info(f"[{group_id}] [批量清理] 开始获取全量文件列表...")
@@ -182,8 +184,10 @@ class GroupFSPlugin(Star):
                     if not file_id: continue
                     is_invalid = False
                     try:
-                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                        url_result = await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                        logger.info(f"[{group_id}] [批量清理] 文件 '{file_name}' 检查成功，API响应: {url_result}")
                     except ActionFailed as e:
+                        logger.error(f"[{group_id}] [批量清理] 文件 '{file_name}' 检查失败！API响应: {e.result}")
                         if e.result.get('retcode') == 1200:
                             is_invalid = True
                     if is_invalid:
@@ -231,7 +235,6 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        await self._trigger_daily_check_if_needed(event)
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
         await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
         asyncio.create_task(self._perform_batch_check(event))
@@ -252,33 +255,22 @@ class GroupFSPlugin(Star):
                 batch = all_files[i:i + batch_size]
                 logger.info(f"[{group_id}] {log_prefix} 正在处理批次 {i//batch_size + 1}/{ -(-total_count // batch_size)}...")
                 for file_info in batch:
-                    checked_count += 1
                     file_id = file_info.get("file_id")
-                    file_name = file_info.get("file_name")
-                    
-                    logger.info(f"[{group_id}] {log_prefix} ({checked_count}/{total_count}) 准备检查文件: {file_info}")
-                    
-                    if not file_id:
-                        logger.warning(f"[{group_id}] {log_prefix} 文件 '{file_name}' 缺少 file_id，已跳过。")
-                        continue
-                    
+                    file_name = file_info.get("file_name", "未知文件名")
+                    if not file_id: continue
                     try:
-                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
-                        logger.info(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查成功，是有效文件。")
+                        url_result = await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                        logger.info(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查成功，API响应: {url_result}")
                     except ActionFailed as e:
-                        logger.error(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查失败！API返回 ActionFailed。")
-                        logger.error(f"[{group_id}] {log_prefix} 完整的异常对象 e: {e}")
-                        logger.error(f"[{group_id}] {log_prefix} 异常内部的 result 字典 e.result: {e.result}")
-                        
+                        logger.error(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查失败！API响应: {e.result}")
                         if e.result.get('retcode') == 1200:
-                            logger.warning(f"[{group_id}] {log_prefix} 判定失效文件: '{file_info.get('file_name')}'，错误: {e.result.get('wording')}")
+                            logger.warning(f"[{group_id}] {log_prefix} 判定失效文件: '{file_name}'，错误: {e.result.get('wording')}")
                             invalid_files_info.append(file_info)
-                    except Exception as e_general:
-                         logger.error(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查时遇到未知错误: {e_general}", exc_info=True)
-
+                        else:
+                            logger.error(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查时API调用失败 (非失效错误): {e.result}")
+                    checked_count += 1
                     await asyncio.sleep(0.2)
-                logger.info(f"[{group_id}] {log_prefix} 批次处理完毕。")
-
+                logger.info(f"[{group_id}] {log_prefix} 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。")
             report_title = "每日检查报告" if is_daily_check else "检查完成！"
             if not invalid_files_info:
                 report_message = f"🎉 {report_title}\n在 {total_count} 个群文件中，未发现任何失效文件。"
@@ -292,7 +284,6 @@ class GroupFSPlugin(Star):
                     report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
                 report_message += "\n" + "-" * 20
                 report_message += "\n建议使用 /cdf 指令进行一键清理。"
-            
             logger.info(f"[{group_id}] {log_prefix} 检查全部完成，准备发送报告。")
             await event.send(MessageChain([Comp.Plain(report_message)]))
         except Exception as e:
