@@ -25,7 +25,7 @@ from . import utils
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "1.8",
+    "0.7",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -39,7 +39,6 @@ class GroupFSPlugin(Star):
         self.cron_tasks = []
         self.last_cron_check_time: Dict[int, datetime.datetime] = {}
         self.bot = None
-        
         self.forward_threshold: int = self.config.get("forward_threshold", 0)
 
         limit_configs = self.config.get("storage_limits", [])
@@ -77,10 +76,11 @@ class GroupFSPlugin(Star):
             group_id = event.get_group_id()
             logger.info(f"[{group_id}] 检测到长消息 (长度: {len(text)} > {self.forward_threshold})，将自动合并转发。")
             try:
+                # --- 关键修改：content 参数直接使用列表，而不是 MessageChain 对象 ---
                 forward_node = Node(
                     uin=event.get_self_id(),
                     name=name,
-                    content=MessageChain([Comp.Plain(text)])
+                    content=[Comp.Plain(text)]
                 )
                 await event.send(MessageChain([forward_node]))
             except Exception as e:
