@@ -69,7 +69,78 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         logger.info("插件 [群文件系统GroupFS] 已加载。")
-        logger.info(f"容量监控配置: {self.storage_limits}")
+
+    @filter.command("cdf")
+    async def on_check_and_delete_command(self, event: AstrMessageEvent):
+        group_id = int(event.get_group_id())
+        user_id = int(event.get_sender_id())
+        logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
+        if user_id not in self.admin_users:
+            await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
+            return
+        await event.send(MessageChain([Comp.Plain("✅ **警告**：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
+        asyncio.create_task(self._perform_batch_check_and_delete(event))
+
+    async def _perform_batch_check_and_delete(self, event: AstrMessageEvent):
+        group_id = int(event.get_group_id())
+        try:
+            logger.info(f"[{group_id}] [批量清理] 开始获取全量文件列表...")
+            all_files = await self._get_all_files_recursive(event)
+            total_count = len(all_files)
+            logger.info(f"[{group_id}] [批量清理] 获取到 {total_count} 个文件，准备分批处理。")
+            deleted_files = []
+            failed_deletions = []
+            checked_count = 0
+            batch_size = 50
+            for i in range(0, total_count, batch_size):
+                batch = all_files[i:i + batch_size]
+                logger.info(f"[{group_id}] [批量清理] 正在处理批次 {i//batch_size + 1}/{ -(-total_count // batch_size)}...")
+                for file_info in batch:
+                    file_id = file_info.get("file_id")
+                    file_name = file_info.get("file_name", "未知文件名")
+                    if not file_id: continue
+                    is_invalid = False
+                    try:
+                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                    except ActionFailed as e:
+                        if e.retcode == 1200 or '(-134)' in str(e.wording):
+                            is_invalid = True
+                    if is_invalid:
+                        logger.warning(f"[{group_id}] [批量清理] 发现失效文件 '{file_name}'，尝试删除...")
+                        try:
+                            delete_result = await event.bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
+                            is_success = False
+                            if delete_result:
+                                trans_result = delete_result.get('transGroupFileResult', {})
+                                result_obj = trans_result.get('result', {})
+                                if result_obj.get('retCode') == 0:
+                                    is_success = True
+                            if is_success:
+                                logger.info(f"[{group_id}] [批量清理] 成功删除失效文件: '{file_name}'")
+                                deleted_files.append(file_name)
+                            else:
+                                logger.error(f"[{group_id}] [批量清理] 删除失效文件 '{file_name}' 失败，API未返回成功。")
+                                failed_deletions.append(file_name)
+                        except Exception as del_e:
+                            logger.error(f"[{group_id}] [批量清理] 删除失效文件 '{file_name}' 时发生异常: {del_e}")
+                            failed_deletions.append(file_name)
+                    checked_count += 1
+                logger.info(f"[{group_id}] [批量清理] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。延时1秒...")
+                await asyncio.sleep(1)
+            report_message = f"✅ 清理完成！\n共扫描了 {total_count} 个文件。\n\n"
+            if deleted_files:
+                report_message += f"成功删除了 {len(deleted_files)} 个失效文件：\n"
+                report_message += "\n".join(f"- {name}" for name in deleted_files)
+            else:
+                report_message += "未发现或未成功删除任何失效文件。"
+            if failed_deletions:
+                report_message += f"\n\n🚨 有 {len(failed_deletions)} 个失效文件删除失败，可能需要手动处理：\n"
+                report_message += "\n".join(f"- {name}" for name in failed_deletions)
+            logger.info(f"[{group_id}] [批量清理] 检查全部完成，准备发送报告。")
+            await event.send(MessageChain([Comp.Plain(report_message)]))
+        except Exception as e:
+            logger.error(f"[{group_id}] [批量清理] 执行过程中发生未知异常: {e}", exc_info=True)
+            await event.send(MessageChain([Comp.Plain("❌ 在执行批量清理时发生内部错误，请检查后台日志。")]))
 
     @filter.command("cf")
     async def on_check_files_command(self, event: AstrMessageEvent):
@@ -79,7 +150,6 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        
         await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
         asyncio.create_task(self._perform_batch_check(event))
 
@@ -90,10 +160,8 @@ class GroupFSPlugin(Star):
             all_files = await self._get_all_files_recursive(event)
             total_count = len(all_files)
             logger.info(f"[{group_id}] [批量检查] 获取到 {total_count} 个文件，准备分批检查。")
-
             invalid_files_info = []
             checked_count = 0
-            
             batch_size = 50
             for i in range(0, total_count, batch_size):
                 batch = all_files[i:i + batch_size]
@@ -110,7 +178,6 @@ class GroupFSPlugin(Star):
                     checked_count += 1
                 logger.info(f"[{group_id}] [批量检查] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。延时1秒...")
                 await asyncio.sleep(1)
-
             if not invalid_files_info:
                 report_message = f"🎉 检查完成！\n在 {total_count} 个群文件中，未发现任何失效文件。"
             else:
@@ -123,7 +190,6 @@ class GroupFSPlugin(Star):
                     report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
                 report_message += "\n" + "-" * 20
                 report_message += "\n建议使用 /df 指令进行清理。"
-            
             logger.info(f"[{group_id}] [批量检查] 检查全部完成，准备发送报告。")
             await event.send(MessageChain([Comp.Plain(report_message)]))
         except Exception as e:
@@ -133,29 +199,22 @@ class GroupFSPlugin(Star):
     async def _get_all_files_recursive(self, event: AstrMessageEvent) -> List[Dict]:
         group_id = int(event.get_group_id())
         all_files = []
-        
-        folders_to_scan = [(None, "根目录")] 
-        
+        folders_to_scan = [(None, "根目录")]
         while folders_to_scan:
             current_folder_id, current_folder_name = folders_to_scan.pop(0)
-            
             if current_folder_id is None:
                 result = await event.bot.api.call_action('get_group_root_files', group_id=group_id)
             else:
                 result = await event.bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id)
-            
             if not result: continue
-
             if result.get('files'):
                 for file_info in result['files']:
                     file_info['parent_folder_name'] = current_folder_name
                     all_files.append(file_info)
-            
             if result.get('folders'):
                 for folder in result['folders']:
                     if folder_id := folder.get('folder_id'):
                         folders_to_scan.append((folder_id, folder.get('folder_name')))
-                        
         return all_files
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -195,7 +254,7 @@ class GroupFSPlugin(Star):
         except Exception as e:
             logger.error(f"[{group_id}] 处理容量检查时发生未知异常: {e}", exc_info=True)
     
-    def _format_search_results(self, files: List[Dict], search_term: str) -> str:
+    def _format_search_results(self, files: List[Dict], search_term: str, for_delete: bool = False) -> str:
         reply_text = f"🔍 找到了 {len(files)} 个与「{search_term}」相关的结果：\n"
         reply_text += "-" * 20
         for i, file_info in enumerate(files, 1):
@@ -206,7 +265,10 @@ class GroupFSPlugin(Star):
                 f"\n  修改时间: {_format_timestamp(file_info.get('modify_time'))}"
             )
         reply_text += "\n" + "-" * 20
-        reply_text += f"\n如需预览，请使用 /sf {search_term} [序号]"
+        if for_delete:
+            reply_text += f"\n请使用 /df {search_term} [序号] 来删除指定文件。"
+        else:
+            reply_text += f"\n如需删除，请使用 /df {search_term} [序号]"
         return reply_text
     
     @filter.command("sf")
@@ -283,7 +345,7 @@ class GroupFSPlugin(Star):
                 await event.send(MessageChain([Comp.Plain("❌ 序号必须是一个数字。")]))
                 return
         else:
-            reply_text = self._format_search_results(found_files, filename_to_find).replace("如需预览", "如需删除")
+            reply_text = self._format_search_results(found_files, filename_to_find, for_delete=True)
             await event.send(MessageChain([Comp.Plain(reply_text)]))
             return
         if not file_to_delete:
