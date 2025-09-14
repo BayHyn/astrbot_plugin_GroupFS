@@ -204,10 +204,14 @@ class GroupFSPlugin(Star):
         folders_to_scan = [(None, "根目录")]
         while folders_to_scan:
             current_folder_id, current_folder_name = folders_to_scan.pop(0)
+            
+            # --- 关键修改：在API调用中增加 file_count 参数 ---
             if current_folder_id is None:
-                result = await event.bot.api.call_action('get_group_root_files', group_id=group_id)
+                # 假设根目录API也支持 file_count，如果不支持，go-cqhttp会自动忽略
+                result = await event.bot.api.call_action('get_group_root_files', group_id=group_id, file_count=2000)
             else:
-                result = await event.bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id)
+                result = await event.bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id, file_count=2000)
+            
             if not result: continue
             if result.get('files'):
                 for file_info in result['files']:
@@ -284,7 +288,18 @@ class GroupFSPlugin(Star):
         filename_to_find = command_parts[1]
         index_str = command_parts[2] if len(command_parts) > 2 else None
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /sf, 目标: '{filename_to_find}', 序号: {index_str}")
-        found_files = await self._find_all_matching_files(event, filename_to_find)
+        
+        # --- 关键修改：将原来的 _find_all_matching_files 逻辑内联到这里 ---
+        all_files = await self._get_all_files_recursive(event)
+        found_files = []
+        for file_info in all_files:
+            current_filename = file_info.get('file_name', '')
+            base_name, _ = os.path.splitext(current_filename)
+            if filename_to_find in base_name or filename_to_find in current_filename:
+                found_files.append(file_info)
+        
+        logger.info(f"[{group_id}] 在 {len(all_files)} 个文件中，找到 {len(found_files)} 个匹配项。")
+
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到与「{filename_to_find}」相关的任何文件。")]))
             return
@@ -328,7 +343,18 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        found_files = await self._find_all_matching_files(event, filename_to_find)
+
+        # --- 关键修改：将原来的 _find_all_matching_files 逻辑内联到这里 ---
+        all_files = await self._get_all_files_recursive(event)
+        found_files = []
+        for file_info in all_files:
+            current_filename = file_info.get('file_name', '')
+            base_name, _ = os.path.splitext(current_filename)
+            if filename_to_find in base_name or filename_to_find in current_filename:
+                found_files.append(file_info)
+
+        logger.info(f"[{group_id}] 在 {len(all_files)} 个文件中，找到 {len(found_files)} 个匹配项用于删除。")
+            
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未找到与「{filename_to_find}」相关的任何文件。")]))
             return
@@ -387,20 +413,16 @@ class GroupFSPlugin(Star):
 
     async def _perform_batch_delete(self, event: AstrMessageEvent, files_to_delete: List[Dict]):
         group_id = int(event.get_group_id())
-        
         deleted_files = []
         failed_deletions = []
-
         total_count = len(files_to_delete)
         logger.info(f"[{group_id}] [批量删除] 开始处理 {total_count} 个文件的删除任务。")
-        
         for i, file_info in enumerate(files_to_delete):
             file_id = file_info.get("file_id")
             file_name = file_info.get("file_name", "未知文件名")
             if not file_id:
                 failed_deletions.append(f"{file_name} (缺少File ID)")
                 continue
-            
             try:
                 logger.info(f"[{group_id}] [批量删除] ({i+1}/{total_count}) 正在删除 '{file_name}'...")
                 delete_result = await event.bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
@@ -410,7 +432,6 @@ class GroupFSPlugin(Star):
                     result_obj = trans_result.get('result', {})
                     if result_obj.get('retCode') == 0:
                         is_success = True
-                
                 if is_success:
                     deleted_files.append(file_name)
                 else:
@@ -418,20 +439,16 @@ class GroupFSPlugin(Star):
             except Exception as e:
                 logger.error(f"[{group_id}] [批量删除] 删除 '{file_name}' 时发生异常: {e}")
                 failed_deletions.append(file_name)
-            
             await asyncio.sleep(0.5)
-
         report_message = f"✅ 批量删除完成！\n共处理了 {total_count} 个文件。\n\n"
         if deleted_files:
             report_message += f"成功删除了 {len(deleted_files)} 个文件：\n"
             report_message += "\n".join(f"- {name}" for name in deleted_files)
         else:
             report_message += "未能成功删除任何文件。"
-
         if failed_deletions:
             report_message += f"\n\n🚨 有 {len(failed_deletions)} 个文件删除失败：\n"
             report_message += "\n".join(f"- {name}" for name in failed_deletions)
-
         logger.info(f"[{group_id}] [批量删除] 任务完成，准备发送报告。")
         await event.send(MessageChain([Comp.Plain(report_message)]))
 
@@ -481,35 +498,7 @@ class GroupFSPlugin(Star):
             logger.error(f"[{group_id}] 获取文件 '{file_name}' 预览时发生未知异常: {e}", exc_info=True)
             return "", f"❌ 预览文件「{file_name}」时发生内部错误。"
 
-    async def _find_all_matching_files(self, event: AstrMessageEvent, filename_to_find: str) -> List[Dict]:
-        group_id = int(event.get_group_id())
-        logger.info(f"[{group_id}] 开始遍历所有文件查找, 目标: '{filename_to_find}'")
-        matching_files = []
-        try:
-            client = event.bot
-            root_files_result = await client.api.call_action('get_group_root_files', group_id=group_id)
-            if root_files_result and root_files_result.get('files'):
-                for file_info in root_files_result['files']:
-                    current_filename = file_info.get('file_name', '')
-                    base_name, _ = os.path.splitext(current_filename)
-                    if filename_to_find in base_name or filename_to_find in current_filename:
-                        matching_files.append(file_info)
-            if root_files_result and root_files_result.get('folders'):
-                for folder in root_files_result['folders']:
-                    folder_id = folder.get('folder_id')
-                    if not folder_id: continue
-                    sub_files_result = await client.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=folder_id)
-                    if sub_files_result and sub_files_result.get('files'):
-                        for file_info in sub_files_result['files']:
-                            current_filename = file_info.get('file_name', '')
-                            base_name, _ = os.path.splitext(current_filename)
-                            if filename_to_find in base_name or filename_to_find in current_filename:
-                                matching_files.append(file_info)
-            logger.info(f"[{group_id}] 查找结束，共找到 {len(matching_files)} 个匹配文件。")
-            return matching_files
-        except Exception as e:
-            logger.error(f"[{group_id}] 查找文件时发生API异常: {e}", exc_info=True)
-            return []
+    # --- 关键修改：删除了独立的 _find_all_matching_files 函数 ---
             
     async def terminate(self):
         logger.info("插件 [群文件系统GroupFS] 已卸载。")
