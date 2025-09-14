@@ -14,6 +14,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
+from astrbot.api.message_components import Node
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
 
@@ -24,7 +25,7 @@ from . import utils
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.6",
+    "0.7",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -38,21 +39,17 @@ class GroupFSPlugin(Star):
         self.cron_tasks = []
         self.last_cron_check_time: Dict[int, datetime.datetime] = {}
         self.bot = None
+        
+        self.forward_threshold: int = self.config.get("forward_threshold", 0)
 
-        # 解析容量监控配置
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
                 group_id_str, count_limit_str, space_limit_str = item.split(':')
                 group_id = int(group_id_str)
-                self.storage_limits[group_id] = {
-                    "count_limit": int(count_limit_str),
-                    "space_limit_gb": float(space_limit_str)
-                }
+                self.storage_limits[group_id] = { "count_limit": int(count_limit_str), "space_limit_gb": float(space_limit_str) }
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
-        
-        # 解析定时任务配置
         cron_configs = self.config.get("scheduled_check_tasks", [])
         for item in cron_configs:
             try:
@@ -63,9 +60,41 @@ class GroupFSPlugin(Star):
                 self.cron_tasks.append((group_id, cron_str))
             except ValueError as e:
                 logger.error(f"解析 scheduled_check_tasks 配置 '{item}' 时出错: {e}，已跳过。")
-        
         logger.info("插件 [群文件系统GroupFS] 已加载。")
+        logger.info(f"长消息转发阈值: {'禁用' if self.forward_threshold <= 0 else str(self.forward_threshold) + '字符'}")
         logger.info(f"定时任务配置: {self.cron_tasks}")
+
+    @filter.on_decorating_result()
+    async def on_result_generated(self, event: AstrMessageEvent):
+        # 如果未设置阈值或设置为0，则禁用此功能
+        if self.forward_threshold <= 0:
+            return
+
+        result = event.get_result()
+        # 确保有结果且结果链不为空
+        if not result or not result.chain:
+            return
+
+        # 计算纯文本长度
+        plain_text = result.get_plain_text()
+        if len(plain_text) > self.forward_threshold:
+            group_id = event.get_group_id()
+            logger.info(f"[{group_id}] 检测到长消息 (长度: {len(plain_text)} > {self.forward_threshold})，将自动合并转发。")
+            try:
+                # 构造一个 Node 节点用于转发
+                # 这里的 uin 和 name 可以自定义，通常用 bot 自己的信息
+                forward_node = Node(
+                    uin=event.get_self_id(),
+                    name="GroupFS", # 自定义转发时显示的名字
+                    content=result.chain
+                )
+                # 发送合并转发消息
+                await event.send(MessageChain([forward_node]))
+                # 清空原始结果链，阻止发送原始的长消息
+                result.chain.clear()
+            except Exception as e:
+                logger.error(f"[{group_id}] 合并转发长消息时出错: {e}", exc_info=True)
+
 
     async def initialize(self):
         if self.cron_tasks:
