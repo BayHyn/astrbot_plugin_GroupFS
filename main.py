@@ -15,7 +15,7 @@ import astrbot.api.message_components as Comp
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
 
-
+# --- 輔助函數 ---
 def _format_bytes(size: int, target_unit=None) -> str:
     if size is None: return "未知大小"
     power = 1024
@@ -71,6 +71,78 @@ class GroupFSPlugin(Star):
         logger.info("插件 [群文件系统GroupFS] 已加载。")
         logger.info(f"容量监控配置: {self.storage_limits}")
 
+    @filter.command("cf")
+    async def on_check_files_command(self, event: AstrMessageEvent):
+        group_id = int(event.get_group_id())
+        user_id = int(event.get_sender_id())
+        logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
+        if user_id not in self.admin_users:
+            await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
+            return
+        await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟到数十分钟，请耐心等待，完成后会在此发送报告。")]))
+        asyncio.create_task(self._perform_batch_check(event))
+
+    async def _perform_batch_check(self, event: AstrMessageEvent):
+        group_id = int(event.get_group_id())
+        try:
+            logger.info(f"[{group_id}] [批量检查] 开始获取全量文件列表...")
+            all_files = await self._get_all_files_recursive(event)
+            total_count = len(all_files)
+            logger.info(f"[{group_id}] [批量检查] 获取到 {total_count} 个文件，准备分批检查。")
+            invalid_files = []
+            checked_count = 0
+            batch_size = 50
+            for i in range(0, total_count, batch_size):
+                batch = all_files[i:i + batch_size]
+                logger.info(f"[{group_id}] [批量检查] 正在处理批次 {i//batch_size + 1}/{ -(-total_count // batch_size)}...")
+                for file_info in batch:
+                    file_id = file_info.get("file_id")
+                    file_name = file_info.get("file_name", "未知文件名")
+                    if not file_id:
+                        continue
+                    try:
+                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                    except ActionFailed as e:
+                        if e.retcode == 1200 or '(-134)' in str(e.wording):
+                            logger.warning(f"[{group_id}] [批量检查] 发现失效文件: '{file_name}'")
+                            invalid_files.append(file_name)
+                    checked_count += 1
+                logger.info(f"[{group_id}] [批量检查] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。延时1秒...")
+                await asyncio.sleep(1)
+            if not invalid_files:
+                report_message = f"🎉 检查完成！\n在 {total_count} 个群文件中，未发现任何失效文件。"
+            else:
+                report_message = f"🚨 检查完成！\n在 {total_count} 个群文件中，共发现 {len(invalid_files)} 个失效文件：\n"
+                report_message += "-" * 20
+                for file_name in invalid_files:
+                    report_message += f"\n- {file_name}"
+                report_message += "\n" + "-" * 20
+                report_message += "\n建议使用 /df 指令进行清理。"
+            logger.info(f"[{group_id}] [批量检查] 检查全部完成，准备发送报告。")
+            await event.send(MessageChain([Comp.Plain(report_message)]))
+        except Exception as e:
+            logger.error(f"[{group_id}] [批量检查] 执行过程中发生未知异常: {e}", exc_info=True)
+            await event.send(MessageChain([Comp.Plain("❌ 在执行批量检查时发生内部错误，请检查后台日志。")]))
+
+    async def _get_all_files_recursive(self, event: AstrMessageEvent) -> List[Dict]:
+        group_id = int(event.get_group_id())
+        all_files = []
+        folders_to_scan = [None]
+        while folders_to_scan:
+            current_folder_id = folders_to_scan.pop(0)
+            if current_folder_id is None:
+                result = await event.bot.api.call_action('get_group_root_files', group_id=group_id)
+            else:
+                result = await event.bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id)
+            if not result: continue
+            if result.get('files'):
+                all_files.extend(result['files'])
+            if result.get('folders'):
+                for folder in result['folders']:
+                    if folder_id := folder.get('folder_id'):
+                        folders_to_scan.append(folder_id)
+        return all_files
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_file_upload(self, event: AstrMessageEvent):
         has_file = any(isinstance(seg, Comp.File) for seg in event.get_messages())
@@ -83,33 +155,26 @@ class GroupFSPlugin(Star):
     async def _check_storage_and_notify(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
         if group_id not in self.storage_limits:
-            return # 如果群未配置监控，则直接返回
-        
+            return
         try:
             client = event.bot
             system_info = await client.api.call_action('get_group_file_system_info', group_id=group_id)
             if not system_info: return
-
             file_count = system_info.get('file_count', 0)
             used_space_bytes = system_info.get('used_space', 0)
             used_space_gb = float(_format_bytes(used_space_bytes, 'GB'))
-
             limits = self.storage_limits[group_id]
             count_limit = limits['count_limit']
             space_limit = limits['space_limit_gb']
-            
             notifications = []
             if file_count >= count_limit:
                 notifications.append(f"文件数量已达 {file_count}，接近或超过设定的 {count_limit} 上限！")
-            
             if used_space_gb >= space_limit:
                 notifications.append(f"已用空间已达 {used_space_gb:.2f}GB，接近或超过设定的 {space_limit:.2f}GB 上限！")
-            
             if notifications:
-                full_notification = "⚠️ 群文件容量警告 ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
+                full_notification = "⚠️ **群文件容量警告** ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
                 logger.warning(f"[{group_id}] 发送容量超限警告: {full_notification}")
                 await event.send(MessageChain([Comp.Plain(full_notification)]))
-
         except ActionFailed as e:
             logger.error(f"[{group_id}] 调用 get_group_file_system_info 失败: {e}")
         except Exception as e:
@@ -140,7 +205,9 @@ class GroupFSPlugin(Star):
         filename_to_find = command_parts[1]
         index_str = command_parts[2] if len(command_parts) > 2 else None
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /sf, 目标: '{filename_to_find}', 序号: {index_str}")
-        await event.send(MessageChain([Comp.Plain(f"正在处理「{filename_to_find}」的请求，请稍候...")]))
+        
+        # --- 关键修改：移除了此处的 "正在处理..." 回复 ---
+
         found_files = await self._find_all_matching_files(event, filename_to_find)
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到与「{filename_to_find}」相关的任何文件。")]))
@@ -154,8 +221,11 @@ class GroupFSPlugin(Star):
             if not (1 <= index <= len(found_files)):
                 await event.send(MessageChain([Comp.Plain(f"❌ 序号错误！找到了 {len(found_files)} 个文件，请输入 1 到 {len(found_files)} 之间的数字。")]))
                 return
+            
+            await event.send(MessageChain([Comp.Plain(f"正在获取「{found_files[index-1].get('file_name')}」的预览，请稍候...")]))
             file_to_preview = found_files[index - 1]
             preview_text, error_msg = await self._get_file_preview(event, file_to_preview)
+            
             if error_msg:
                 await event.send(MessageChain([Comp.Plain(error_msg)]))
                 return
@@ -251,7 +321,7 @@ class GroupFSPlugin(Star):
             if e.retcode == 1200 or '(-134)' in str(e.wording):
                 error_message = (
                     f"❌ 预览文件「{file_name}」失败：\n"
-                    f"该文件可能已失效。\n"
+                    f"该文件可能已失效或被服务器清理。\n"
                     f"建议使用 /df {os.path.splitext(file_name)[0]} 将其删除。"
                 )
                 return "", error_message
