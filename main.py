@@ -70,141 +70,7 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         logger.info("插件 [群文件系统GroupFS] 已加载。")
-    
-    @filter.command("df")
-    async def on_delete_file_command(self, event: AstrMessageEvent):
-        group_id = int(event.get_group_id())
-        user_id = int(event.get_sender_id())
-        
-        command_parts = event.message_str.split(maxsplit=2)
-        if len(command_parts) < 2 or not command_parts[1]:
-            await event.send(MessageChain([Comp.Plain("❓ 请提供要删除的文件名。用法: /df <文件名> [序号]")]))
-            return
-            
-        filename_to_find = command_parts[1]
-        index_str = command_parts[2] if len(command_parts) > 2 else None
-        
-        logger.info(f"[{group_id}] 用户 {user_id} 触发删除指令 /df, 目标: '{filename_to_find}', 序号: {index_str}")
 
-        if user_id not in self.admin_users:
-            await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
-            return
-
-        found_files = await self._find_all_matching_files(event, filename_to_find)
-
-        if not found_files:
-            await event.send(MessageChain([Comp.Plain(f"❌ 未找到与「{filename_to_find}」相关的任何文件。")]))
-            return
-
-        # --- 关键修改：处理序号 '0' 的逻辑 ---
-        if index_str == '0':
-            # 不再发送前置提醒，直接创建后台任务
-            asyncio.create_task(self._perform_batch_delete(event, found_files))
-            return
-
-        file_to_delete = None
-        if len(found_files) == 1 and not index_str:
-            file_to_delete = found_files[0]
-        elif index_str:
-            try:
-                index = int(index_str)
-                if 1 <= index <= len(found_files):
-                    file_to_delete = found_files[index - 1]
-                else:
-                    await event.send(MessageChain([Comp.Plain(f"❌ 序号错误！找到了 {len(found_files)} 个文件，请输入 1 到 {len(found_files)} 之间的数字。")]))
-                    return
-            except ValueError:
-                await event.send(MessageChain([Comp.Plain("❌ 序号必须是一个数字。")]))
-                return
-        else:
-            reply_text = self._format_search_results(found_files, filename_to_find, for_delete=True)
-            await event.send(MessageChain([Comp.Plain(reply_text)]))
-            return
-
-        if not file_to_delete:
-            await event.send(MessageChain([Comp.Plain("❌ 内部错误，未能确定要删除的文件。")]))
-            return
-
-        # 执行单个文件删除
-        try:
-            file_id_to_delete = file_to_delete.get("file_id")
-            found_filename = file_to_delete.get("file_name")
-            if not file_id_to_delete:
-                await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{found_filename}」，但无法获取其ID，删除失败。")]))
-                return
-
-            logger.info(f"[{group_id}] 确认删除文件 '{found_filename}', File ID: {file_id_to_delete}...")
-            client = event.bot
-            delete_result = await client.api.call_action('delete_group_file', group_id=group_id, file_id=file_id_to_delete)
-            is_success = False
-            if delete_result:
-                trans_result = delete_result.get('transGroupFileResult', {})
-                result_obj = trans_result.get('result', {})
-                if result_obj.get('retCode') == 0:
-                    is_success = True
-            if is_success:
-                await event.send(MessageChain([Comp.Plain(f"✅ 文件「{found_filename}」已成功删除。")]))
-                logger.info(f"[{group_id}] 文件 '{found_filename}' 已成功删除。")
-            else:
-                error_msg = delete_result.get('wording', 'API未返回成功状态')
-                await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{found_filename}」失败: {error_msg}")]))
-        except Exception as e:
-            logger.error(f"[{group_id}] 处理删除流程时发生未知异常: {e}", exc_info=True)
-            await event.send(MessageChain([Comp.Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
-            
-    async def _perform_batch_delete(self, event: AstrMessageEvent, files_to_delete: List[Dict]):
-        group_id = int(event.get_group_id())
-        
-        deleted_files = []
-        failed_deletions = []
-
-        total_count = len(files_to_delete)
-        logger.info(f"[{group_id}] [批量删除] 开始处理 {total_count} 个文件的删除任务。")
-        
-        for i, file_info in enumerate(files_to_delete):
-            file_id = file_info.get("file_id")
-            file_name = file_info.get("file_name", "未知文件名")
-            if not file_id:
-                failed_deletions.append(f"{file_name} (缺少File ID)")
-                continue
-            
-            try:
-                logger.info(f"[{group_id}] [批量删除] ({i+1}/{total_count}) 正在删除 '{file_name}'...")
-                delete_result = await event.bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
-                is_success = False
-                if delete_result:
-                    trans_result = delete_result.get('transGroupFileResult', {})
-                    result_obj = trans_result.get('result', {})
-                    if result_obj.get('retCode') == 0:
-                        is_success = True
-                
-                if is_success:
-                    deleted_files.append(file_name)
-                else:
-                    failed_deletions.append(file_name)
-            except Exception as e:
-                logger.error(f"[{group_id}] [批量删除] 删除 '{file_name}' 时发生异常: {e}")
-                failed_deletions.append(file_name)
-            
-            await asyncio.sleep(0.5)
-
-        # 准备并发送最终报告
-        report_message = f"✅ 批量删除完成！\n共处理了 {total_count} 个文件。\n\n"
-        if deleted_files:
-            report_message += f"成功删除了 {len(deleted_files)} 个文件：\n"
-            report_message += "\n".join(f"- {name}" for name in deleted_files)
-        else:
-            report_message += "未能成功删除任何文件。"
-
-        if failed_deletions:
-            report_message += f"\n\n🚨 有 {len(failed_deletions)} 个文件删除失败：\n"
-            report_message += "\n".join(f"- {name}" for name in failed_deletions)
-
-        logger.info(f"[{group_id}] [批量删除] 任务完成，准备发送报告。")
-        await event.send(MessageChain([Comp.Plain(report_message)]))
-    
-    # ... (其余所有指令和辅助函数，如 on_check_and_delete_command, on_check_files_command, _perform_batch_check, on_search_file_command 等，保持不变) ...
-    # 为了简洁，此处省略
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
@@ -215,7 +81,11 @@ class GroupFSPlugin(Star):
             return
         await event.send(MessageChain([Comp.Plain("⚠️ **警告**：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
         asyncio.create_task(self._perform_batch_check_and_delete(event))
+        # --- 关键修改：拦截事件 ---
+        event.stop_event()
+
     async def _perform_batch_check_and_delete(self, event: AstrMessageEvent):
+        # ... (此函数代码不变)
         group_id = int(event.get_group_id())
         try:
             logger.info(f"[{group_id}] [批量清理] 开始获取全量文件列表...")
@@ -275,6 +145,7 @@ class GroupFSPlugin(Star):
         except Exception as e:
             logger.error(f"[{group_id}] [批量清理] 执行过程中发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain("❌ 在执行批量清理时发生内部错误，请检查后台日志。")]))
+
     @filter.command("cf")
     async def on_check_files_command(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
@@ -285,7 +156,11 @@ class GroupFSPlugin(Star):
             return
         await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
         asyncio.create_task(self._perform_batch_check(event))
+        # --- 关键修改：拦截事件 ---
+        event.stop_event()
+
     async def _perform_batch_check(self, event: AstrMessageEvent):
+        # ... (此函数代码不变)
         group_id = int(event.get_group_id())
         try:
             logger.info(f"[{group_id}] [批量检查] 开始获取全量文件列表...")
@@ -327,6 +202,81 @@ class GroupFSPlugin(Star):
         except Exception as e:
             logger.error(f"[{group_id}] [批量检查] 执行过程中发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain("❌ 在执行批量检查时发生内部错误，请检查后台日志。")]))
+    
+    @filter.command("df")
+    async def on_delete_file_command(self, event: AstrMessageEvent):
+        group_id = int(event.get_group_id())
+        user_id = int(event.get_sender_id())
+        command_parts = event.message_str.split(maxsplit=2)
+        if len(command_parts) < 2 or not command_parts[1]:
+            await event.send(MessageChain([Comp.Plain("❓ 请提供要删除的文件名。用法: /df <文件名> [序号]")]))
+            return
+        filename_to_find = command_parts[1]
+        index_str = command_parts[2] if len(command_parts) > 2 else None
+        logger.info(f"[{group_id}] 用户 {user_id} 触发删除指令 /df, 目标: '{filename_to_find}', 序号: {index_str}")
+        if user_id not in self.admin_users:
+            await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
+            return
+        found_files = await self._find_all_matching_files(event, filename_to_find)
+        if not found_files:
+            await event.send(MessageChain([Comp.Plain(f"❌ 未找到与「{filename_to_find}」相关的任何文件。")]))
+            return
+            
+        if index_str == '0':
+            asyncio.create_task(self._perform_batch_delete(event, found_files))
+            # --- 关键修改：拦截事件 ---
+            event.stop_event()
+            return
+
+        file_to_delete = None
+        if len(found_files) == 1 and not index_str:
+            file_to_delete = found_files[0]
+        elif index_str:
+            try:
+                index = int(index_str)
+                if 1 <= index <= len(found_files):
+                    file_to_delete = found_files[index - 1]
+                else:
+                    await event.send(MessageChain([Comp.Plain(f"❌ 序号错误！找到了 {len(found_files)} 个文件，请输入 1 到 {len(found_files)} 之间的数字。")]))
+                    return
+            except ValueError:
+                await event.send(MessageChain([Comp.Plain("❌ 序号必须是一个数字。")]))
+                return
+        else:
+            reply_text = self._format_search_results(found_files, filename_to_find, for_delete=True)
+            await event.send(MessageChain([Comp.Plain(reply_text)]))
+            return
+
+        if not file_to_delete:
+            await event.send(MessageChain([Comp.Plain("❌ 内部错误，未能确定要删除的文件。")]))
+            return
+        try:
+            # ... (单个文件删除逻辑不变)
+            file_id_to_delete = file_to_delete.get("file_id")
+            found_filename = file_to_delete.get("file_name")
+            if not file_id_to_delete:
+                await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{found_filename}」，但无法获取其ID，删除失败。")]))
+                return
+            logger.info(f"[{group_id}] 确认删除文件 '{found_filename}', File ID: {file_id_to_delete}...")
+            client = event.bot
+            delete_result = await client.api.call_action('delete_group_file', group_id=group_id, file_id=file_id_to_delete)
+            is_success = False
+            if delete_result:
+                trans_result = delete_result.get('transGroupFileResult', {})
+                result_obj = trans_result.get('result', {})
+                if result_obj.get('retCode') == 0:
+                    is_success = True
+            if is_success:
+                await event.send(MessageChain([Comp.Plain(f"✅ 文件「{found_filename}」已成功删除。")]))
+                logger.info(f"[{group_id}] 文件 '{found_filename}' 已成功删除。")
+            else:
+                error_msg = delete_result.get('wording', 'API未返回成功状态')
+                await event.send(MessageChain([Comp.Plain(f"❌ 删除文件「{found_filename}」失败: {error_msg}")]))
+        except Exception as e:
+            logger.error(f"[{group_id}] 处理删除流程时发生未知异常: {e}", exc_info=True)
+            await event.send(MessageChain([Comp.Plain(f"❌ 处理删除时发生内部错误，请检查后台日志。")]))
+
+    # ... (其余所有辅助函数，如 _get_all_files_recursive, on_group_file_upload, sf, get_preview 等，保持不变) ...
     async def _get_all_files_recursive(self, event: AstrMessageEvent) -> List[Dict]:
         group_id = int(event.get_group_id())
         all_files = []
