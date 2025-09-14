@@ -5,7 +5,7 @@ import datetime
 # --- 辅助函数：格式化文件大小 ---
 def format_bytes(size: int, target_unit=None) -> str:
     if size is None: return "未知大小"
-    power = 12
+    power = 1024
     n = 0
     power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
     if target_unit and target_unit.upper() in power_labels.values():

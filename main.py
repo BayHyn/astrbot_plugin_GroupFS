@@ -111,7 +111,7 @@ class GroupFSPlugin(Star):
                     try:
                         await bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
-                        if e.retcode == 1200 or '(-134)' in str(e.wording):
+                        if e.retcode == 1200 and '(-134)' in str(e.wording):
                             invalid_files_info.append(file_info)
                     await asyncio.sleep(0.2)
             if not invalid_files_info:
@@ -164,7 +164,7 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        await event.send(MessageChain([Comp.Plain("⚠️ **警告**：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
+        await event.send(MessageChain([Comp.Plain("⚠️ 警告：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
         asyncio.create_task(self._perform_batch_check_and_delete(event))
         event.stop_event()
 
@@ -190,7 +190,7 @@ class GroupFSPlugin(Star):
                     try:
                         await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
-                        if e.retcode == 1200 or '(-134)' in str(e.wording):
+                        if e.retcode == 1200 and '(-134)' in str(e.wording):
                             is_invalid = True
                     if is_invalid:
                         logger.warning(f"[{group_id}] [批量清理] 发现失效文件 '{file_name}'，尝试删除...")
@@ -212,7 +212,8 @@ class GroupFSPlugin(Star):
                             logger.error(f"[{group_id}] [批量清理] 删除失效文件 '{file_name}' 时发生异常: {del_e}")
                             failed_deletions.append(file_name)
                     checked_count += 1
-                logger.info(f"[{group_id}] [批量清理] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。延时1秒...")
+                    await asyncio.sleep(0.2)
+                logger.info(f"[{group_id}] [批量清理] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。")
                 await asyncio.sleep(1)
             report_message = f"✅ 清理完成！\n共扫描了 {total_count} 个文件。\n\n"
             if deleted_files:
@@ -261,12 +262,12 @@ class GroupFSPlugin(Star):
                     try:
                         await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
-                        if e.retcode == 1200 or '(-134)' in str(e.wording):
+                        if e.retcode == 1200 and '(-134)' in str(e.wording):
                             logger.warning(f"[{group_id}] [批量检查] 发现失效文件: '{file_info.get('file_name')}'")
                             invalid_files_info.append(file_info)
                     checked_count += 1
-                logger.info(f"[{group_id}] [批量检查] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。延时1秒...")
-                await asyncio.sleep(1)
+                    await asyncio.sleep(0.2)
+                logger.info(f"[{group_id}] [批量检查] 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。")
             if not invalid_files_info:
                 report_message = f"🎉 检查完成！\n在 {total_count} 个群文件中，未发现任何失效文件。"
             else:
@@ -315,7 +316,7 @@ class GroupFSPlugin(Star):
             if used_space_gb >= space_limit:
                 notifications.append(f"已用空间已达 {used_space_gb:.2f}GB，接近或超过设定的 {space_limit:.2f}GB 上限！")
             if notifications:
-                full_notification = "⚠️ **群文件容量警告** ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
+                full_notification = "⚠️ 群文件容量警告 ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
                 logger.warning(f"[{group_id}] 发送容量超限警告: {full_notification}")
                 await event.send(MessageChain([Comp.Plain(full_notification)]))
         except ActionFailed as e:
@@ -528,7 +529,7 @@ class GroupFSPlugin(Star):
             url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
         except ActionFailed as e:
             logger.warning(f"[{group_id}] 获取文件 '{file_name}' 下载链接时API调用失败: {e}")
-            if e.retcode == 1200 or '(-134)' in str(e.wording):
+            if e.retcode == 1200 and '(-134)' in str(e.wording):
                 error_message = (
                     f"❌ 预览文件「{file_name}」失败：\n"
                     f"该文件可能已失效或被服务器清理。\n"
@@ -560,6 +561,6 @@ class GroupFSPlugin(Star):
         except Exception as e:
             logger.error(f"[{group_id}] 获取文件 '{file_name}' 预览时发生未知异常: {e}", exc_info=True)
             return "", f"❌ 预览文件「{file_name}」时发生内部错误。"
-
+            
     async def terminate(self):
         logger.info("插件 [群文件系统GroupFS] 已卸载。")
