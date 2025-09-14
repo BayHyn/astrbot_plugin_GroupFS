@@ -1,5 +1,6 @@
 # astrbot_plugin_GroupFS/main.py
 
+# 请确保已安装依赖: pip install croniter aiohttp chardet
 import asyncio
 import os
 import datetime
@@ -7,6 +8,7 @@ from typing import List, Dict, Optional
 
 import aiohttp
 import chardet
+import croniter
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
@@ -15,38 +17,14 @@ import astrbot.api.message_components as Comp
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
 
-# --- 辅助函数 ---
-def _format_bytes(size: int, target_unit=None) -> str:
-    if size is None: return "未知大小"
-    power = 1024
-    n = 0
-    power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
-    if target_unit and target_unit.upper() in power_labels.values():
-        target_n = list(power_labels.keys())[list(power_labels.values()).index(target_unit.upper())]
-        while n < target_n:
-            size /= power
-            n += 1
-        return f"{size:.2f}"
-    while size > power and n < len(power_labels) -1 :
-        size /= power
-        n += 1
-    return f"{size:.2f} {power_labels[n]}"
-
-def _format_timestamp(ts: int) -> str:
-    if ts is None or ts == 0: return "未知时间"
-    return datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
-
-SUPPORTED_PREVIEW_EXTENSIONS = (
-    '.txt', '.md', '.json', '.xml', '.html', '.css', 
-    '.js', '.py', '.java', '.c', '.cpp', '.h', '.hpp', 
-    '.go', '.rs', '.rb', '.php', '.log', '.ini', '.yml', '.yaml'
-)
+# 从 utils.py 导入辅助函数和常量
+from . import utils
 
 @register(
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.5",
+    "0.6",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -57,6 +35,9 @@ class GroupFSPlugin(Star):
         self.admin_users: List[int] = [int(u) for u in self.config.get("admin_users", [])]
         self.preview_length: int = self.config.get("preview_length", 300)
         self.storage_limits: Dict[int, Dict] = {}
+        self.cron_tasks = []
+        self.last_cron_check_time: Dict[int, datetime.datetime] = {}
+
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
@@ -68,10 +49,107 @@ class GroupFSPlugin(Star):
                 }
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
+        
+        cron_configs = self.config.get("scheduled_check_tasks", [])
+        for item in cron_configs:
+            try:
+                group_id_str, cron_str = item.split(':', 1)
+                group_id = int(group_id_str)
+                if not croniter.croniter.is_valid(cron_str):
+                    raise ValueError(f"无效的 cron 表达式: {cron_str}")
+                self.cron_tasks.append((group_id, cron_str))
+            except ValueError as e:
+                logger.error(f"解析 scheduled_check_tasks 配置 '{item}' 时出错: {e}，已跳过。")
+        
         logger.info("插件 [群文件系统GroupFS] 已加载。")
+        logger.info(f"定时任务配置: {self.cron_tasks}")
 
+    async def initialize(self):
+        if self.cron_tasks:
+            logger.info("[定时任务] 启动失效文件检查循环...")
+            asyncio.create_task(self.scheduled_check_loop())
+
+    async def scheduled_check_loop(self):
+        await asyncio.sleep(10)
+        while True:
+            now = datetime.datetime.now()
+            await asyncio.sleep(60 - now.second)
+            now = datetime.datetime.now()
+            
+            for group_id, cron_str in self.cron_tasks:
+                if croniter.croniter.match(cron_str, now):
+                    last_check = self.last_cron_check_time.get(group_id)
+                    if last_check and last_check.minute == now.minute and last_check.hour == now.hour:
+                        continue
+                    logger.info(f"[{group_id}] [定时任务] Cron 表达式 '{cron_str}' 已触发，开始执行。")
+                    self.last_cron_check_time[group_id] = now
+                    asyncio.create_task(self._perform_batch_check_for_cron(group_id))
+
+    async def _perform_batch_check_for_cron(self, group_id: int):
+        try:
+            bot = self.context.bot
+            logger.info(f"[{group_id}] [定时任务] 开始获取全量文件列表...")
+            all_files = await self._get_all_files_recursive_core(group_id, bot)
+            total_count = len(all_files)
+            logger.info(f"[{group_id}] [定时任务] 获取到 {total_count} 个文件，准备分批检查。")
+            invalid_files_info = []
+            batch_size = 50
+            for i in range(0, total_count, batch_size):
+                batch = all_files[i:i + batch_size]
+                for file_info in batch:
+                    file_id = file_info.get("file_id")
+                    if not file_id: continue
+                    try:
+                        await bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                    except ActionFailed as e:
+                        if e.retcode == 1200 or '(-134)' in str(e.wording):
+                            invalid_files_info.append(file_info)
+                    await asyncio.sleep(0.2)
+            if not invalid_files_info:
+                logger.info(f"[{group_id}] [定时任务] 检查完成，未发现失效文件。")
+                return 
+            report_message = f"🚨 定时检查报告\n在 {total_count} 个群文件中，共发现 {len(invalid_files_info)} 个失效文件：\n"
+            report_message += "-" * 20
+            for info in invalid_files_info:
+                folder_name = info.get('parent_folder_name', '未知')
+                modify_time = utils.format_timestamp(info.get('modify_time'))
+                report_message += f"\n- {info.get('file_name')}"
+                report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
+            report_message += "\n" + "-" * 20
+            report_message += "\n建议管理员使用 /cdf 指令进行一键清理。"
+            logger.info(f"[{group_id}] [定时任务] 检查全部完成，准备发送报告。")
+            await bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
+        except Exception as e:
+            logger.error(f"[{group_id}] [定时任务] 执行过程中发生未知异常: {e}", exc_info=True)
+
+    async def _get_all_files_recursive_core(self, group_id: int, bot) -> List[Dict]:
+        all_files = []
+        folders_to_scan = [(None, "根目录")]
+        while folders_to_scan:
+            current_folder_id, current_folder_name = folders_to_scan.pop(0)
+            try:
+                if current_folder_id is None:
+                    result = await bot.api.call_action('get_group_root_files', group_id=group_id, file_count=2000)
+                else:
+                    result = await bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id, file_count=2000)
+                if not result: continue
+                if result.get('files'):
+                    for file_info in result['files']:
+                        file_info['parent_folder_name'] = current_folder_name
+                        all_files.append(file_info)
+                if result.get('folders'):
+                    for folder in result['folders']:
+                        if folder_id := folder.get('folder_id'):
+                            folders_to_scan.append((folder_id, folder.get('folder_name')))
+            except Exception as e:
+                logger.error(f"[{group_id}] 递归获取文件夹 '{current_folder_name}' 内容时出错: {e}")
+                continue
+        return all_files
+    
+    # 之前的所有指令和函数都从您提供的代码中完整保留
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
+        # ... (此函数及以下所有函数，均为您上一版本中的完整代码)
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
@@ -86,7 +164,7 @@ class GroupFSPlugin(Star):
         group_id = int(event.get_group_id())
         try:
             logger.info(f"[{group_id}] [批量清理] 开始获取全量文件列表...")
-            all_files = await self._get_all_files_recursive(event)
+            all_files = await self._get_all_files_recursive_core(group_id, event.bot)
             total_count = len(all_files)
             logger.info(f"[{group_id}] [批量清理] 获取到 {total_count} 个文件，准备分批处理。")
             deleted_files = []
@@ -159,7 +237,7 @@ class GroupFSPlugin(Star):
         group_id = int(event.get_group_id())
         try:
             logger.info(f"[{group_id}] [批量检查] 开始获取全量文件列表...")
-            all_files = await self._get_all_files_recursive(event)
+            all_files = await self._get_all_files_recursive_core(group_id, event.bot)
             total_count = len(all_files)
             logger.info(f"[{group_id}] [批量检查] 获取到 {total_count} 个文件，准备分批检查。")
             invalid_files_info = []
@@ -187,7 +265,7 @@ class GroupFSPlugin(Star):
                 report_message += "-" * 20
                 for info in invalid_files_info:
                     folder_name = info.get('parent_folder_name', '未知')
-                    modify_time = _format_timestamp(info.get('modify_time'))
+                    modify_time = utils.format_timestamp(info.get('modify_time'))
                     report_message += f"\n- {info.get('file_name')}"
                     report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
                 report_message += "\n" + "-" * 20
@@ -197,31 +275,6 @@ class GroupFSPlugin(Star):
         except Exception as e:
             logger.error(f"[{group_id}] [批量检查] 执行过程中发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain("❌ 在执行批量检查时发生内部错误，请检查后台日志。")]))
-
-    async def _get_all_files_recursive(self, event: AstrMessageEvent) -> List[Dict]:
-        group_id = int(event.get_group_id())
-        all_files = []
-        folders_to_scan = [(None, "根目录")]
-        while folders_to_scan:
-            current_folder_id, current_folder_name = folders_to_scan.pop(0)
-            
-            # --- 关键修改：在API调用中增加 file_count 参数 ---
-            if current_folder_id is None:
-                # 假设根目录API也支持 file_count，如果不支持，go-cqhttp会自动忽略
-                result = await event.bot.api.call_action('get_group_root_files', group_id=group_id, file_count=2000)
-            else:
-                result = await event.bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id, file_count=2000)
-            
-            if not result: continue
-            if result.get('files'):
-                for file_info in result['files']:
-                    file_info['parent_folder_name'] = current_folder_name
-                    all_files.append(file_info)
-            if result.get('folders'):
-                for folder in result['folders']:
-                    if folder_id := folder.get('folder_id'):
-                        folders_to_scan.append((folder_id, folder.get('folder_name')))
-        return all_files
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_file_upload(self, event: AstrMessageEvent):
@@ -242,7 +295,7 @@ class GroupFSPlugin(Star):
             if not system_info: return
             file_count = system_info.get('file_count', 0)
             used_space_bytes = system_info.get('used_space', 0)
-            used_space_gb = float(_format_bytes(used_space_bytes, 'GB'))
+            used_space_gb = float(utils.format_bytes(used_space_bytes, 'GB'))
             limits = self.storage_limits[group_id]
             count_limit = limits['count_limit']
             space_limit = limits['space_limit_gb']
@@ -267,8 +320,8 @@ class GroupFSPlugin(Star):
             reply_text += (
                 f"\n[{i}] {file_info.get('file_name')}"
                 f"\n  上传者: {file_info.get('uploader_name', '未知')}"
-                f"\n  大小: {_format_bytes(file_info.get('size'))}"
-                f"\n  修改时间: {_format_timestamp(file_info.get('modify_time'))}"
+                f"\n  大小: {utils.format_bytes(file_info.get('size'))}"
+                f"\n  修改时间: {utils.format_timestamp(file_info.get('modify_time'))}"
             )
         reply_text += "\n" + "-" * 20
         if for_delete:
@@ -289,8 +342,7 @@ class GroupFSPlugin(Star):
         index_str = command_parts[2] if len(command_parts) > 2 else None
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /sf, 目标: '{filename_to_find}', 序号: {index_str}")
         
-        # --- 关键修改：将原来的 _find_all_matching_files 逻辑内联到这里 ---
-        all_files = await self._get_all_files_recursive(event)
+        all_files = await self._get_all_files_recursive_core(group_id, event.bot)
         found_files = []
         for file_info in all_files:
             current_filename = file_info.get('file_name', '')
@@ -344,8 +396,7 @@ class GroupFSPlugin(Star):
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
 
-        # --- 关键修改：将原来的 _find_all_matching_files 逻辑内联到这里 ---
-        all_files = await self._get_all_files_recursive(event)
+        all_files = await self._get_all_files_recursive_core(group_id, event.bot)
         found_files = []
         for file_info in all_files:
             current_filename = file_info.get('file_name', '')
@@ -457,7 +508,7 @@ class GroupFSPlugin(Star):
         file_id = file_info.get("file_id")
         file_name = file_info.get("file_name", "")
         _, file_extension = os.path.splitext(file_name)
-        if file_extension.lower() not in SUPPORTED_PREVIEW_EXTENSIONS:
+        if file_extension.lower() not in utils.SUPPORTED_PREVIEW_EXTENSIONS:
             return "", f"❌ 文件「{file_name}」不是支持的文本格式，无法预览。"
         logger.info(f"[{group_id}] 正在为文件 '{file_name}' (ID: {file_id}) 获取预览...")
         try:
@@ -498,7 +549,5 @@ class GroupFSPlugin(Star):
             logger.error(f"[{group_id}] 获取文件 '{file_name}' 预览时发生未知异常: {e}", exc_info=True)
             return "", f"❌ 预览文件「{file_name}」时发生内部错误。"
 
-    # --- 关键修改：删除了独立的 _find_all_matching_files 函数 ---
-            
     async def terminate(self):
         logger.info("插件 [群文件系统GroupFS] 已卸载。")
