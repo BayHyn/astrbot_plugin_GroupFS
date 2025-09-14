@@ -156,10 +156,10 @@ class GroupFSPlugin(Star):
         if not self.bot: self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
+        logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
         await event.send(MessageChain([Comp.Plain("⚠️ 警告：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
         asyncio.create_task(self._perform_batch_check_and_delete(event))
         event.stop_event()
@@ -184,10 +184,8 @@ class GroupFSPlugin(Star):
                     if not file_id: continue
                     is_invalid = False
                     try:
-                        url_result = await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
-                        logger.info(f"[{group_id}] [批量清理] 文件 '{file_name}' 检查成功，API响应: {url_result}")
+                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
-                        logger.error(f"[{group_id}] [批量清理] 文件 '{file_name}' 检查失败！API响应: {e.result}")
                         if e.result.get('retcode') == 1200:
                             is_invalid = True
                     if is_invalid:
@@ -256,18 +254,13 @@ class GroupFSPlugin(Star):
                 logger.info(f"[{group_id}] {log_prefix} 正在处理批次 {i//batch_size + 1}/{ -(-total_count // batch_size)}...")
                 for file_info in batch:
                     file_id = file_info.get("file_id")
-                    file_name = file_info.get("file_name", "未知文件名")
                     if not file_id: continue
                     try:
-                        url_result = await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
-                        logger.info(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查成功，API响应: {url_result}")
+                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
-                        logger.error(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查失败！API响应: {e.result}")
                         if e.result.get('retcode') == 1200:
-                            logger.warning(f"[{group_id}] {log_prefix} 判定失效文件: '{file_name}'，错误: {e.result.get('wording')}")
+                            logger.warning(f"[{group_id}] {log_prefix} 判定失效文件: '{file_info.get('file_name')}'，错误: {e.result.get('wording')}")
                             invalid_files_info.append(file_info)
-                        else:
-                            logger.error(f"[{group_id}] {log_prefix} 文件 '{file_name}' 检查时API调用失败 (非失效错误): {e.result}")
                     checked_count += 1
                     await asyncio.sleep(0.2)
                 logger.info(f"[{group_id}] {log_prefix} 批次处理完毕，已检查 {checked_count}/{total_count} 个文件。")
@@ -357,6 +350,7 @@ class GroupFSPlugin(Star):
         filename_to_find = command_parts[1]
         index_str = command_parts[2] if len(command_parts) > 2 else None
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /sf, 目标: '{filename_to_find}', 序号: {index_str}")
+        
         all_files = await self._get_all_files_recursive_core(group_id, event.bot)
         found_files = []
         for file_info in all_files:
@@ -364,7 +358,9 @@ class GroupFSPlugin(Star):
             base_name, _ = os.path.splitext(current_filename)
             if filename_to_find in base_name or filename_to_find in current_filename:
                 found_files.append(file_info)
+        
         logger.info(f"[{group_id}] 在 {len(all_files)} 个文件中，找到 {len(found_files)} 个匹配项。")
+
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未在群文件中找到与「{filename_to_find}」相关的任何文件。")]))
             return
@@ -409,6 +405,7 @@ class GroupFSPlugin(Star):
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
+
         all_files = await self._get_all_files_recursive_core(group_id, event.bot)
         found_files = []
         for file_info in all_files:
@@ -416,14 +413,18 @@ class GroupFSPlugin(Star):
             base_name, _ = os.path.splitext(current_filename)
             if filename_to_find in base_name or filename_to_find in current_filename:
                 found_files.append(file_info)
+
         logger.info(f"[{group_id}] 在 {len(all_files)} 个文件中，找到 {len(found_files)} 个匹配项用于删除。")
+            
         if not found_files:
             await event.send(MessageChain([Comp.Plain(f"❌ 未找到与「{filename_to_find}」相关的任何文件。")]))
             return
+            
         if index_str == '0':
             asyncio.create_task(self._perform_batch_delete(event, found_files))
             event.stop_event()
             return
+
         file_to_delete = None
         if len(found_files) == 1 and not index_str:
             file_to_delete = found_files[0]
@@ -442,6 +443,7 @@ class GroupFSPlugin(Star):
             reply_text = self._format_search_results(found_files, filename_to_find, for_delete=True)
             await event.send(MessageChain([Comp.Plain(reply_text)]))
             return
+
         if not file_to_delete:
             await event.send(MessageChain([Comp.Plain("❌ 内部错误，未能确定要删除的文件。")]))
             return
