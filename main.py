@@ -37,7 +37,11 @@ class GroupFSPlugin(Star):
         self.storage_limits: Dict[int, Dict] = {}
         self.cron_tasks = []
         self.last_cron_check_time: Dict[int, datetime.datetime] = {}
+        
+        # 新增一个变量来“记住”bot实例
+        self.bot = None
 
+        # 解析容量监控配置
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
@@ -50,6 +54,7 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         
+        # 解析定时任务配置
         cron_configs = self.config.get("scheduled_check_tasks", [])
         for item in cron_configs:
             try:
@@ -87,7 +92,11 @@ class GroupFSPlugin(Star):
 
     async def _perform_batch_check_for_cron(self, group_id: int):
         try:
-            bot = self.context.bot
+            if not self.bot:
+                logger.warning(f"[{group_id}] [定时任务] 无法执行，因为尚未捕获到 bot 实例。请先触发任意一次指令。")
+                return
+            bot = self.bot
+
             logger.info(f"[{group_id}] [定时任务] 开始获取全量文件列表...")
             all_files = await self._get_all_files_recursive_core(group_id, bot)
             total_count = len(all_files)
@@ -146,17 +155,16 @@ class GroupFSPlugin(Star):
                 continue
         return all_files
     
-    # 之前的所有指令和函数都从您提供的代码中完整保留
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
-        # ... (此函数及以下所有函数，均为您上一版本中的完整代码)
+        if not self.bot: self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        await event.send(MessageChain([Comp.Plain("⚠️ 警告：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
+        await event.send(MessageChain([Comp.Plain("⚠️ **警告**：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
         asyncio.create_task(self._perform_batch_check_and_delete(event))
         event.stop_event()
 
@@ -223,6 +231,7 @@ class GroupFSPlugin(Star):
 
     @filter.command("cf")
     async def on_check_files_command(self, event: AstrMessageEvent):
+        if not self.bot: self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
@@ -278,6 +287,7 @@ class GroupFSPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_file_upload(self, event: AstrMessageEvent):
+        if not self.bot: self.bot = event.bot
         has_file = any(isinstance(seg, Comp.File) for seg in event.get_messages())
         if has_file:
             group_id = int(event.get_group_id())
@@ -305,7 +315,7 @@ class GroupFSPlugin(Star):
             if used_space_gb >= space_limit:
                 notifications.append(f"已用空间已达 {used_space_gb:.2f}GB，接近或超过设定的 {space_limit:.2f}GB 上限！")
             if notifications:
-                full_notification = "⚠️ 群文件容量警告 ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
+                full_notification = "⚠️ **群文件容量警告** ⚠️\n" + "\n".join(notifications) + "\n请及时清理文件！"
                 logger.warning(f"[{group_id}] 发送容量超限警告: {full_notification}")
                 await event.send(MessageChain([Comp.Plain(full_notification)]))
         except ActionFailed as e:
@@ -332,6 +342,7 @@ class GroupFSPlugin(Star):
     
     @filter.command("sf")
     async def on_search_file_command(self, event: AstrMessageEvent):
+        if not self.bot: self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         command_parts = event.message_str.split(maxsplit=2)
@@ -383,6 +394,7 @@ class GroupFSPlugin(Star):
             
     @filter.command("df")
     async def on_delete_file_command(self, event: AstrMessageEvent):
+        if not self.bot: self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         command_parts = event.message_str.split(maxsplit=2)
