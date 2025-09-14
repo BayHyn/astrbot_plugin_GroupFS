@@ -25,7 +25,7 @@ from . import utils
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.7",
+    "1.8",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -64,42 +64,30 @@ class GroupFSPlugin(Star):
         logger.info(f"长消息转发阈值: {'禁用' if self.forward_threshold <= 0 else str(self.forward_threshold) + '字符'}")
         logger.info(f"定时任务配置: {self.cron_tasks}")
 
-    @filter.on_decorating_result()
-    async def on_result_generated(self, event: AstrMessageEvent):
-        # 如果未设置阈值或设置为0，则禁用此功能
-        if self.forward_threshold <= 0:
-            return
-
-        result = event.get_result()
-        # 确保有结果且结果链不为空
-        if not result or not result.chain:
-            return
-
-        # 计算纯文本长度
-        plain_text = result.get_plain_text()
-        if len(plain_text) > self.forward_threshold:
-            group_id = event.get_group_id()
-            logger.info(f"[{group_id}] 检测到长消息 (长度: {len(plain_text)} > {self.forward_threshold})，将自动合并转发。")
-            try:
-                # 构造一个 Node 节点用于转发
-                # 这里的 uin 和 name 可以自定义，通常用 bot 自己的信息
-                forward_node = Node(
-                    uin=event.get_self_id(),
-                    name="GroupFS", # 自定义转发时显示的名字
-                    content=result.chain
-                )
-                # 发送合并转发消息
-                await event.send(MessageChain([forward_node]))
-                # 清空原始结果链，阻止发送原始的长消息
-                result.chain.clear()
-            except Exception as e:
-                logger.error(f"[{group_id}] 合并转发长消息时出错: {e}", exc_info=True)
-
-
     async def initialize(self):
         if self.cron_tasks:
             logger.info("[定时任务] 启动失效文件检查循环...")
             asyncio.create_task(self.scheduled_check_loop())
+
+    async def _send_or_forward(self, event: AstrMessageEvent, text: str, name: str = "GroupFS"):
+        """
+        检查文本长度，如果超过阈值则合并转发，否则直接发送。
+        """
+        if self.forward_threshold > 0 and len(text) > self.forward_threshold:
+            group_id = event.get_group_id()
+            logger.info(f"[{group_id}] 检测到长消息 (长度: {len(text)} > {self.forward_threshold})，将自动合并转发。")
+            try:
+                forward_node = Node(
+                    uin=event.get_self_id(),
+                    name=name,
+                    content=MessageChain([Comp.Plain(text)])
+                )
+                await event.send(MessageChain([forward_node]))
+            except Exception as e:
+                logger.error(f"[{group_id}] 合并转发长消息时出错: {e}", exc_info=True)
+                await event.send(MessageChain([Comp.Plain(text[:self.forward_threshold] + "... (消息过长且合并转发失败)")]))
+        else:
+            await event.send(MessageChain([Comp.Plain(text)]))
 
     async def scheduled_check_loop(self):
         await asyncio.sleep(10)
@@ -141,6 +129,8 @@ class GroupFSPlugin(Star):
                     await asyncio.sleep(0.2)
             if not invalid_files_info:
                 logger.info(f"[{group_id}] [定时任务] 检查完成，未发现失效文件。")
+                # report_message = f"🎉 定时检查报告\n在 {total_count} 个群文件中，未发现任何失效文件。"
+                # await bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
                 return 
             report_message = f"🚨 定时检查报告\n在 {total_count} 个群文件中，共发现 {len(invalid_files_info)} 个失效文件：\n"
             report_message += "-" * 20
@@ -249,7 +239,7 @@ class GroupFSPlugin(Star):
                 report_message += f"\n\n🚨 有 {len(failed_deletions)} 个失效文件删除失败，可能需要手动处理：\n"
                 report_message += "\n".join(f"- {name}" for name in failed_deletions)
             logger.info(f"[{group_id}] [批量清理] 检查全部完成，准备发送报告。")
-            await event.send(MessageChain([Comp.Plain(report_message)]))
+            await self._send_or_forward(event, report_message, name="失效文件清理报告")
         except Exception as e:
             logger.error(f"[{group_id}] [批量清理] 执行过程中发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain("❌ 在执行批量清理时发生内部错误，请检查后台日志。")]))
@@ -307,7 +297,7 @@ class GroupFSPlugin(Star):
                 report_message += "\n" + "-" * 20
                 report_message += "\n建议使用 /cdf 指令进行一键清理。"
             logger.info(f"[{group_id}] {log_prefix} 检查全部完成，准备发送报告。")
-            await event.send(MessageChain([Comp.Plain(report_message)]))
+            await self._send_or_forward(event, report_message, name="失效文件检查报告")
         except Exception as e:
             logger.error(f"[{group_id}] {log_prefix} 执行过程中发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain("❌ 在执行批量检查时发生内部错误，请检查后台日志。")]))
@@ -395,7 +385,7 @@ class GroupFSPlugin(Star):
             return
         if not index_str:
             reply_text = self._format_search_results(found_files, filename_to_find)
-            await event.send(MessageChain([Comp.Plain(reply_text)]))
+            await self._send_or_forward(event, reply_text, name="文件搜索结果")
             return
         try:
             index = int(index_str)
@@ -412,7 +402,7 @@ class GroupFSPlugin(Star):
                 + "-" * 20 + "\n"
                 + preview_text
             )
-            await event.send(MessageChain([Comp.Plain(reply_text)]))
+            await self._send_or_forward(event, reply_text, name=f"文件预览：{file_to_preview.get('file_name')}")
         except ValueError:
             await event.send(MessageChain([Comp.Plain("❌ 序号必须是一个数字。")]))
         except Exception as e:
@@ -470,7 +460,7 @@ class GroupFSPlugin(Star):
                 return
         else:
             reply_text = self._format_search_results(found_files, filename_to_find, for_delete=True)
-            await event.send(MessageChain([Comp.Plain(reply_text)]))
+            await self._send_or_forward(event, reply_text, name="文件搜索结果")
             return
 
         if not file_to_delete:
@@ -540,7 +530,7 @@ class GroupFSPlugin(Star):
             report_message += f"\n\n🚨 有 {len(failed_deletions)} 个文件删除失败：\n"
             report_message += "\n".join(f"- {name}" for name in failed_deletions)
         logger.info(f"[{group_id}] [批量删除] 任务完成，准备发送报告。")
-        await event.send(MessageChain([Comp.Plain(report_message)]))
+        await self._send_or_forward(event, report_message, name="批量删除报告")
 
     async def _get_file_preview(self, event: AstrMessageEvent, file_info: dict) -> tuple[str, str | None]:
         group_id = int(event.get_group_id())
