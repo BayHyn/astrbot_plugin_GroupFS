@@ -302,7 +302,7 @@ class GroupFSPlugin(Star):
             logger.error(f"[{group_id}] {log_prefix} 执行过程中发生未知异常: {e}", exc_info=True)
             await event.send(MessageChain([Comp.Plain("❌ 在执行批量检查时发生内部错误，请检查后台日志。")]))
     
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
     async def on_group_file_upload(self, event: AstrMessageEvent):
         if not self.bot: self.bot = event.bot
         has_file = any(isinstance(seg, Comp.File) for seg in event.get_messages())
