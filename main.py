@@ -37,10 +37,13 @@ class GroupFSPlugin(Star):
         self.preview_length: int = self.config.get("preview_length", 300)
         self.storage_limits: Dict[int, Dict] = {}
         self.cron_tasks = []
-        self.last_cron_check_time: Dict[int, datetime.datetime] = {}
+        self.last_cron_check_time: Dict[str, datetime.datetime] = {}
         self.bot = None
         self.forward_threshold: int = self.config.get("forward_threshold", 0)
+        self.running_tasks = set()
+        self.scheduler_lock = asyncio.Lock()
 
+        # 解析容量监控配置
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
@@ -49,6 +52,8 @@ class GroupFSPlugin(Star):
                 self.storage_limits[group_id] = { "count_limit": int(count_limit_str), "space_limit_gb": float(space_limit_str) }
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
+        
+        # 解析定时任务配置
         cron_configs = self.config.get("scheduled_check_tasks", [])
         for item in cron_configs:
             try:
@@ -56,32 +61,31 @@ class GroupFSPlugin(Star):
                 group_id = int(group_id_str)
                 if not croniter.croniter.is_valid(cron_str):
                     raise ValueError(f"无效的 cron 表达式: {cron_str}")
-                self.cron_tasks.append((group_id, cron_str))
+                task_key = f"{group_id}:{cron_str}"
+                self.cron_tasks.append((task_key, group_id, cron_str))
             except ValueError as e:
                 logger.error(f"解析 scheduled_check_tasks 配置 '{item}' 时出错: {e}，已跳过。")
+        
         logger.info("插件 [群文件系统GroupFS] 已加载。")
-        logger.info(f"长消息转发阈值: {'禁用' if self.forward_threshold <= 0 else str(self.forward_threshold) + '字符'}")
-        logger.info(f"定时任务配置: {self.cron_tasks}")
 
     async def initialize(self):
+        # 在初始化时直接获取并存储 bot 实例
+        if hasattr(self.context, "bot") and self.context.bot:
+            self.bot = self.context.bot
+            logger.info("[初始化] 成功从 context 中获取 bot 实例。")
+        else:
+            logger.warning("[初始化] 未能从 context 中直接获取 bot 实例，将依赖指令触发来捕获。")
+
         if self.cron_tasks:
             logger.info("[定时任务] 启动失效文件检查循环...")
             asyncio.create_task(self.scheduled_check_loop())
 
     async def _send_or_forward(self, event: AstrMessageEvent, text: str, name: str = "GroupFS"):
-        """
-        检查文本长度，如果超过阈值则合并转发，否则直接发送。
-        """
         if self.forward_threshold > 0 and len(text) > self.forward_threshold:
             group_id = event.get_group_id()
             logger.info(f"[{group_id}] 检测到长消息 (长度: {len(text)} > {self.forward_threshold})，将自动合并转发。")
             try:
-                # --- 关键修改：content 参数直接使用列表，而不是 MessageChain 对象 ---
-                forward_node = Node(
-                    uin=event.get_self_id(),
-                    name=name,
-                    content=[Comp.Plain(text)]
-                )
+                forward_node = Node(uin=event.get_self_id(), name=name, content=[Comp.Plain(text)])
                 await event.send(MessageChain([forward_node]))
             except Exception as e:
                 logger.error(f"[{group_id}] 合并转发长消息时出错: {e}", exc_info=True)
@@ -94,15 +98,18 @@ class GroupFSPlugin(Star):
         while True:
             now = datetime.datetime.now()
             await asyncio.sleep(60 - now.second)
-            now = datetime.datetime.now()
-            for group_id, cron_str in self.cron_tasks:
-                if croniter.croniter.match(cron_str, now):
-                    last_check = self.last_cron_check_time.get(group_id)
-                    if last_check and last_check.minute == now.minute and last_check.hour == now.hour:
-                        continue
-                    logger.info(f"[{group_id}] [定时任务] Cron 表达式 '{cron_str}' 已触发，开始执行。")
-                    self.last_cron_check_time[group_id] = now
-                    asyncio.create_task(self._perform_batch_check_for_cron(group_id))
+            
+            async with self.scheduler_lock:
+                now_aligned = datetime.datetime.now().replace(second=0, microsecond=0)
+                for task_key, group_id, cron_str in self.cron_tasks:
+                    if croniter.croniter.match(cron_str, now_aligned):
+                        if task_key in self.running_tasks:
+                            logger.warning(f"[{group_id}] [定时任务] 检测到上一个任务 '{task_key}' 仍在运行，本次触发已跳过。")
+                            continue
+                        logger.info(f"[{group_id}] [定时任务] Cron 表达式 '{cron_str}' 已触发，开始执行。")
+                        self.running_tasks.add(task_key)
+                        task = asyncio.ensure_future(self._perform_batch_check_for_cron(group_id))
+                        task.add_done_callback(lambda t, key=task_key: self.running_tasks.remove(key))
 
     async def _perform_batch_check_for_cron(self, group_id: int):
         try:
@@ -129,8 +136,6 @@ class GroupFSPlugin(Star):
                     await asyncio.sleep(0.2)
             if not invalid_files_info:
                 logger.info(f"[{group_id}] [定时任务] 检查完成，未发现失效文件。")
-                # report_message = f"🎉 定时检查报告\n在 {total_count} 个群文件中，未发现任何失效文件。"
-                # await bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
                 return 
             report_message = f"🚨 定时检查报告\n在 {total_count} 个群文件中，共发现 {len(invalid_files_info)} 个失效文件：\n"
             report_message += "-" * 20
