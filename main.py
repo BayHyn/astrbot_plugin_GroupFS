@@ -1,3 +1,6 @@
+# astrbot_plugin_GroupFS/main.py
+
+# 请确保已安装依赖: pip install croniter aiohttp chardet
 import asyncio
 import os
 import datetime
@@ -41,15 +44,12 @@ class GroupFSPlugin(Star):
         self.running_tasks = set()
         self.scheduler_lock = asyncio.Lock()
         
-        # === 新增 Bot QQ号配置项 ===
         self.bot_qq_id = self.config.get("bot_qq_id")
 
-        # === 新增 ZIP 预览相关配置项 ===
         self.enable_zip_preview: bool = self.config.get("enable_zip_preview", False)
         self.default_zip_password: str = self.config.get("default_zip_password", "")
         self.download_semaphore = asyncio.Semaphore(5)
 
-        # 解析容量监控配置
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
@@ -59,7 +59,6 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         
-        # 解析定时任务配置
         cron_configs = self.config.get("scheduled_check_tasks", [])
         for item in cron_configs:
             try:
@@ -75,13 +74,11 @@ class GroupFSPlugin(Star):
         logger.info("插件 [群文件系统GroupFS] 已加载。")
 
     async def initialize(self):
-        # 延迟初始化，等待bot连接成功
         asyncio.create_task(self._delayed_start_scheduler())
 
     async def _delayed_start_scheduler(self):
         """延迟启动调度器，给系统时间初始化"""
         try:
-            # 等待10秒让系统完全初始化
             await asyncio.sleep(10)
             if self.cron_tasks:
                 logger.info("[定时任务] 启动失效文件检查循环...")
@@ -92,17 +89,24 @@ class GroupFSPlugin(Star):
     def _get_bot(self) -> Optional[object]:
         """
         获取并更新bot实例。
-        优先从 self.context 获取，如果配置了 bot_qq_id，则通过它匹配。
+        优先从 self.context.bots 列表通过 bot_qq_id 匹配。
+        如果未配置 bot_qq_id，则退回使用 self.context.bot。
         """
         if self.bot is None:
-            if self.context and hasattr(self.context, "bot") and self.context.bot:
-                # 检查bot_qq_id是否匹配
-                if self.bot_qq_id and str(self.context.bot.self_id) != str(self.bot_qq_id):
-                    logger.warning(f"配置的 bot_qq_id ({self.bot_qq_id}) 与 AstrBot 上下文中的bot不匹配 ({self.context.bot.self_id})，请检查配置。")
-                    return None
-                
-                self.bot = self.context.bot
-                logger.info(f"[Bot实例] 成功从 context 中获取bot实例 ({self.bot.self_id})。")
+            if self.context and hasattr(self.context, "bots") and self.context.bots:
+                if self.bot_qq_id:
+                    for bot_instance in self.context.bots:
+                        if str(bot_instance.self_id) == str(self.bot_qq_id):
+                            self.bot = bot_instance
+                            logger.info(f"[Bot实例] 成功通过 bot_qq_id 获取bot实例 ({self.bot_qq_id})。")
+                            return self.bot
+                    logger.warning(f"[Bot实例] 未能在 context.bots 中找到匹配 bot_qq_id ({self.bot_qq_id}) 的实例。")
+                else:
+                    if self.context.bot:
+                        self.bot = self.context.bot
+                        logger.warning("[Bot实例] bot_qq_id 未配置，已使用 context 中的默认Bot实例。")
+                    else:
+                        logger.warning("[Bot实例] bot_qq_id 未配置且 context.bot 不可用。")
             else:
                 logger.warning("[Bot实例] 无法从 context 获取bot实例，可能尚未连接。")
         return self.bot
@@ -121,7 +125,6 @@ class GroupFSPlugin(Star):
             await event.send(MessageChain([Comp.Plain(text)]))
 
     async def scheduled_check_loop(self):
-        await asyncio.sleep(10)
         while True:
             now = datetime.datetime.now()
             await asyncio.sleep(60 - now.second)
@@ -205,8 +208,6 @@ class GroupFSPlugin(Star):
     
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
-        # 优先从事件中获取bot实例，并更新本地缓存
-        self.bot = event.bot 
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
@@ -285,14 +286,11 @@ class GroupFSPlugin(Star):
 
     @filter.command("cf")
     async def on_check_files_command(self, event: AstrMessageEvent):
-        # 优先从事件中获取bot实例，并更新本地缓存
-        self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         if user_id not in self.admin_users:
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
-        logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
         await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
         asyncio.create_task(self._perform_batch_check(event))
         event.stop_event()
@@ -349,8 +347,6 @@ class GroupFSPlugin(Star):
     
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
     async def on_group_file_upload(self, event: AstrMessageEvent):
-        # 优先从事件中获取bot实例，并更新本地缓存
-        self.bot = event.bot
         has_file = any(isinstance(seg, Comp.File) for seg in event.get_messages())
         if has_file:
             group_id = int(event.get_group_id())
@@ -410,8 +406,6 @@ class GroupFSPlugin(Star):
     
     @filter.command("sf")
     async def on_search_file_command(self, event: AstrMessageEvent):
-        # 优先从事件中获取bot实例，并更新本地缓存
-        self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         bot = self._get_bot()
@@ -452,11 +446,9 @@ class GroupFSPlugin(Star):
             file_to_preview = found_files[index - 1]
             preview_text, error_msg = await self._get_file_preview(event, file_to_preview)
             if error_msg:
-                # 预览失败，直接发送错误信息
                 await event.send(MessageChain([Comp.Plain(error_msg)]))
                 return
             
-            # 预览成功，构建回复消息
             reply_text = (
                 f"📄 文件「{file_to_preview.get('file_name')}」内容预览：\n"
                 + "-" * 20 + "\n"
@@ -471,8 +463,6 @@ class GroupFSPlugin(Star):
             
     @filter.command("df")
     async def on_delete_file_command(self, event: AstrMessageEvent):
-        # 优先从事件中获取bot实例，并更新本地缓存
-        self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         bot = self._get_bot()
@@ -704,7 +694,6 @@ class GroupFSPlugin(Star):
         try:
             async with aiohttp.ClientSession() as session:
                 async with self.download_semaphore:
-                    # 对于ZIP文件，需要下载完整文件，因为可能需要密码解压
                     range_header = None
                     if is_txt:
                         range_header = {'Range': 'bytes=0-4095'}
@@ -712,7 +701,6 @@ class GroupFSPlugin(Star):
                         if resp.status != 200 and resp.status != 206:
                             return "", f"❌ 下载文件「{file_name}」失败 (HTTP: {resp.status})。"
                         
-                        # 创建临时文件
                         temp_dir = os.path.join(os.getcwd(), 'temp_file_previews')
                         os.makedirs(temp_dir, exist_ok=True)
                         local_file_path = os.path.join(temp_dir, f"{file_id}_{file_name}")
