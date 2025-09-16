@@ -26,7 +26,7 @@
     "default_zip_password": {
         "description": "默认ZIP解压密码",
         "hint": "在预览加密的ZIP压缩包时，会尝试使用此密码进行解压。",
-        "type": "str",
+        "type": "string",
         "default": ""
     },
     "storage_limits": {
