@@ -44,7 +44,9 @@ class GroupFSPlugin(Star):
         self.running_tasks = set()
         self.scheduler_lock = asyncio.Lock()
         
-        # === 新增 ZIP 预览相关配置项 ===
+        # 新增：用于跟踪所有由插件创建的异步任务
+        self.active_tasks = [] 
+        
         self.enable_zip_preview: bool = self.config.get("enable_zip_preview", False)
         self.default_zip_password: str = self.config.get("default_zip_password", "")
         self.download_semaphore = asyncio.Semaphore(5)
@@ -59,16 +61,25 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         
-        # 解析定时任务配置
+        # 解析定时任务配置，并进行去重
         cron_configs = self.config.get("scheduled_check_tasks", [])
+        seen_tasks = set()
         for item in cron_configs:
             try:
                 group_id_str, cron_str = item.split(':', 1)
                 group_id = int(group_id_str)
                 if not croniter.croniter.is_valid(cron_str):
                     raise ValueError(f"无效的 cron 表达式: {cron_str}")
+                
+                # 使用元组作为去重依据
+                task_identifier = (group_id, cron_str)
+                if task_identifier in seen_tasks:
+                    logger.warning(f"检测到重复的定时任务配置 '{item}'，已跳过。")
+                    continue
+                
                 task_key = f"{group_id}:{cron_str}"
                 self.cron_tasks.append((task_key, group_id, cron_str))
+                seen_tasks.add(task_identifier)
             except ValueError as e:
                 logger.error(f"解析 scheduled_check_tasks 配置 '{item}' 时出错: {e}，已跳过。")
         
@@ -84,7 +95,8 @@ class GroupFSPlugin(Star):
 
         if self.cron_tasks:
             logger.info("[定时任务] 启动失效文件检查循环...")
-            asyncio.create_task(self.scheduled_check_loop())
+            # 将创建的任务句柄添加到列表中
+            self.active_tasks.append(asyncio.create_task(self.scheduled_check_loop()))
 
     async def _send_or_forward(self, event: AstrMessageEvent, text: str, name: str = "GroupFS"):
         if self.forward_threshold > 0 and len(text) > self.forward_threshold:
@@ -100,13 +112,14 @@ class GroupFSPlugin(Star):
             await event.send(MessageChain([Comp.Plain(text)]))
 
     async def scheduled_check_loop(self):
-        await asyncio.sleep(10)
+        # 修复后的定时任务循环，确保每分钟只检查一次
+        now = datetime.datetime.now()
+        await asyncio.sleep(60 - now.second)
+        
         while True:
-            now = datetime.datetime.now()
-            await asyncio.sleep(60 - now.second)
+            now_aligned = datetime.datetime.now().replace(second=0, microsecond=0)
             
             async with self.scheduler_lock:
-                now_aligned = datetime.datetime.now().replace(second=0, microsecond=0)
                 for task_key, group_id, cron_str in self.cron_tasks:
                     if croniter.croniter.match(cron_str, now_aligned):
                         if task_key in self.running_tasks:
@@ -116,6 +129,8 @@ class GroupFSPlugin(Star):
                         self.running_tasks.add(task_key)
                         task = asyncio.ensure_future(self._perform_batch_check_for_cron(group_id))
                         task.add_done_callback(lambda t, key=task_key: self.running_tasks.remove(key))
+            
+            await asyncio.sleep(60)
 
     async def _perform_batch_check_for_cron(self, group_id: int):
         try:
@@ -191,7 +206,7 @@ class GroupFSPlugin(Star):
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
         await event.send(MessageChain([Comp.Plain("⚠️ 警告：即将开始扫描并自动删除所有失效文件！\n此过程可能需要几分钟，请耐心等待，完成后将发送报告。")]))
-        asyncio.create_task(self._perform_batch_check_and_delete(event))
+        self.active_tasks.append(asyncio.create_task(self._perform_batch_check_and_delete(event)))
         event.stop_event()
 
     async def _perform_batch_check_and_delete(self, event: AstrMessageEvent):
@@ -265,7 +280,7 @@ class GroupFSPlugin(Star):
             return
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
         await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
-        asyncio.create_task(self._perform_batch_check(event))
+        self.active_tasks.append(asyncio.create_task(self._perform_batch_check(event)))
         event.stop_event()
 
     async def _perform_batch_check(self, event: AstrMessageEvent, is_daily_check: bool = False):
@@ -320,8 +335,7 @@ class GroupFSPlugin(Star):
         if has_file:
             group_id = int(event.get_group_id())
             logger.info(f"[{group_id}] 检测到文件上传事件，将在5秒后触发容量检查。")
-            await asyncio.sleep(5) 
-            await self._check_storage_and_notify(event)
+            self.active_tasks.append(asyncio.create_task(self._check_storage_and_notify(event)))
 
     async def _check_storage_and_notify(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
@@ -454,7 +468,7 @@ class GroupFSPlugin(Star):
             return
             
         if index_str == '0':
-            asyncio.create_task(self._perform_batch_delete(event, found_files))
+            self.active_tasks.append(asyncio.create_task(self._perform_batch_delete(event, found_files)))
             event.stop_event()
             return
 
@@ -694,4 +708,15 @@ class GroupFSPlugin(Star):
                     logger.warning(f"删除临时文件 {local_file_path} 失败: {e}")
 
     async def terminate(self):
+        logger.info("插件 [群文件系统GroupFS] 正在卸载，取消所有定时任务...")
+        for task in self.active_tasks:
+            if not task.done():
+                task.cancel()
+        
+        try:
+            # 等待所有任务真正结束
+            await asyncio.gather(*self.active_tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            pass
+        
         logger.info("插件 [群文件系统GroupFS] 已卸载。")
