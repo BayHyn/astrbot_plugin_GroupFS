@@ -11,6 +11,12 @@
         "type": "list",
         "default": []
     },
+    "bot_qq_id": {
+        "type": "string",
+        "description": "机器人QQ号",
+        "default": "",
+        "hint": "用于定时任务的机器人QQ号，填写后可启用自动检查功能。如果留空，定时任务需要手动触发一次指令来激活。"
+    },
     "preview_length": {
         "description": "文本预览长度 (字符)",
         "hint": "使用 /sf 文件名 <序号> 指令时，显示的内容预览的最大字符数。",

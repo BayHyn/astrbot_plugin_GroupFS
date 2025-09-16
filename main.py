@@ -1,6 +1,3 @@
-# astrbot_plugin_GroupFS/main.py
-
-# 请确保已安装依赖: pip install croniter aiohttp chardet
 import asyncio
 import os
 import datetime
@@ -44,6 +41,9 @@ class GroupFSPlugin(Star):
         self.running_tasks = set()
         self.scheduler_lock = asyncio.Lock()
         
+        # === 新增 Bot QQ号配置项 ===
+        self.bot_qq_id = self.config.get("bot_qq_id")
+
         # === 新增 ZIP 预览相关配置项 ===
         self.enable_zip_preview: bool = self.config.get("enable_zip_preview", False)
         self.default_zip_password: str = self.config.get("default_zip_password", "")
@@ -75,20 +75,41 @@ class GroupFSPlugin(Star):
         logger.info("插件 [群文件系统GroupFS] 已加载。")
 
     async def initialize(self):
-        # 在初始化时直接获取并存储 bot 实例
-        if hasattr(self.context, "bot") and self.context.bot:
-            self.bot = self.context.bot
-            logger.info("[初始化] 成功从 context 中获取 bot 实例。")
-        else:
-            logger.warning("[初始化] 未能从 context 中直接获取 bot 实例，将依赖指令触发来捕获。")
+        # 延迟初始化，等待bot连接成功
+        asyncio.create_task(self._delayed_start_scheduler())
 
-        if self.cron_tasks:
-            logger.info("[定时任务] 启动失效文件检查循环...")
-            asyncio.create_task(self.scheduled_check_loop())
+    async def _delayed_start_scheduler(self):
+        """延迟启动调度器，给系统时间初始化"""
+        try:
+            # 等待10秒让系统完全初始化
+            await asyncio.sleep(10)
+            if self.cron_tasks:
+                logger.info("[定时任务] 启动失效文件检查循环...")
+                asyncio.create_task(self.scheduled_check_loop())
+        except Exception as e:
+            logger.error(f"延迟启动调度器失败: {e}", exc_info=True)
 
+    def _get_bot(self) -> Optional[object]:
+        """
+        获取并更新bot实例。
+        优先从 self.context 获取，如果配置了 bot_qq_id，则通过它匹配。
+        """
+        if self.bot is None:
+            if self.context and hasattr(self.context, "bot") and self.context.bot:
+                # 检查bot_qq_id是否匹配
+                if self.bot_qq_id and str(self.context.bot.self_id) != str(self.bot_qq_id):
+                    logger.warning(f"配置的 bot_qq_id ({self.bot_qq_id}) 与 AstrBot 上下文中的bot不匹配 ({self.context.bot.self_id})，请检查配置。")
+                    return None
+                
+                self.bot = self.context.bot
+                logger.info(f"[Bot实例] 成功从 context 中获取bot实例 ({self.bot.self_id})。")
+            else:
+                logger.warning("[Bot实例] 无法从 context 获取bot实例，可能尚未连接。")
+        return self.bot
+    
     async def _send_or_forward(self, event: AstrMessageEvent, text: str, name: str = "GroupFS"):
         if self.forward_threshold > 0 and len(text) > self.forward_threshold:
-            group_id = event.get_group_id()
+            group_id = int(event.get_group_id())
             logger.info(f"[{group_id}] 检测到长消息 (长度: {len(text)} > {self.forward_threshold})，将自动合并转发。")
             try:
                 forward_node = Node(uin=event.get_self_id(), name=name, content=[Comp.Plain(text)])
@@ -118,11 +139,12 @@ class GroupFSPlugin(Star):
                         task.add_done_callback(lambda t, key=task_key: self.running_tasks.remove(key))
 
     async def _perform_batch_check_for_cron(self, group_id: int):
+        bot = self._get_bot()
+        if not bot:
+            logger.warning(f"[{group_id}] [定时任务] 无法执行，因为尚未获取到 bot 实例。")
+            return
+        
         try:
-            if not self.bot:
-                logger.warning(f"[{group_id}] [定时任务] 无法执行，因为尚未捕获到 bot 实例。请先触发任意一次指令。")
-                return
-            bot = self.bot
             logger.info(f"[{group_id}] [定时任务] 开始获取全量文件列表...")
             all_files = await self._get_all_files_recursive_core(group_id, bot)
             total_count = len(all_files)
@@ -183,7 +205,8 @@ class GroupFSPlugin(Star):
     
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
-        if not self.bot: self.bot = event.bot
+        # 优先从事件中获取bot实例，并更新本地缓存
+        self.bot = event.bot 
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cdf 失效文件清理指令。")
@@ -196,9 +219,14 @@ class GroupFSPlugin(Star):
 
     async def _perform_batch_check_and_delete(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
+        bot = self._get_bot()
+        if not bot:
+            await event.send(MessageChain([Comp.Plain("❌ 无法获取机器人实例，请稍后再试或联系管理员。")]))
+            return
+        
         try:
             logger.info(f"[{group_id}] [批量清理] 开始获取全量文件列表...")
-            all_files = await self._get_all_files_recursive_core(group_id, event.bot)
+            all_files = await self._get_all_files_recursive_core(group_id, bot)
             total_count = len(all_files)
             logger.info(f"[{group_id}] [批量清理] 获取到 {total_count} 个文件，准备分批处理。")
             deleted_files = []
@@ -214,14 +242,14 @@ class GroupFSPlugin(Star):
                     if not file_id: continue
                     is_invalid = False
                     try:
-                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                        await bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
                         if e.result.get('retcode') == 1200:
                             is_invalid = True
                     if is_invalid:
                         logger.warning(f"[{group_id}] [批量清理] 发现失效文件 '{file_name}'，尝试删除...")
                         try:
-                            delete_result = await event.bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
+                            delete_result = await bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
                             is_success = False
                             if delete_result:
                                 trans_result = delete_result.get('transGroupFileResult', {})
@@ -257,7 +285,8 @@ class GroupFSPlugin(Star):
 
     @filter.command("cf")
     async def on_check_files_command(self, event: AstrMessageEvent):
-        if not self.bot: self.bot = event.bot
+        # 优先从事件中获取bot实例，并更新本地缓存
+        self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
         if user_id not in self.admin_users:
@@ -270,10 +299,15 @@ class GroupFSPlugin(Star):
 
     async def _perform_batch_check(self, event: AstrMessageEvent, is_daily_check: bool = False):
         group_id = int(event.get_group_id())
+        bot = self._get_bot()
+        if not bot:
+            await event.send(MessageChain([Comp.Plain("❌ 无法获取机器人实例，请稍后再试或联系管理员。")]))
+            return
+        
         try:
             log_prefix = "[每日自动检查]" if is_daily_check else "[批量检查]"
             logger.info(f"[{group_id}] {log_prefix} 开始获取全量文件列表...")
-            all_files = await self._get_all_files_recursive_core(group_id, event.bot)
+            all_files = await self._get_all_files_recursive_core(group_id, bot)
             total_count = len(all_files)
             logger.info(f"[{group_id}] {log_prefix} 获取到 {total_count} 个文件，准备分批检查。")
             invalid_files_info = []
@@ -286,7 +320,7 @@ class GroupFSPlugin(Star):
                     file_id = file_info.get("file_id")
                     if not file_id: continue
                     try:
-                        await event.bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+                        await bot.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
                     except ActionFailed as e:
                         if e.result.get('retcode') == 1200:
                             logger.warning(f"[{group_id}] {log_prefix} 判定失效文件: '{file_info.get('file_name')}'，错误: {e.result.get('wording')}")
@@ -315,7 +349,8 @@ class GroupFSPlugin(Star):
     
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
     async def on_group_file_upload(self, event: AstrMessageEvent):
-        if not self.bot: self.bot = event.bot
+        # 优先从事件中获取bot实例，并更新本地缓存
+        self.bot = event.bot
         has_file = any(isinstance(seg, Comp.File) for seg in event.get_messages())
         if has_file:
             group_id = int(event.get_group_id())
@@ -325,10 +360,15 @@ class GroupFSPlugin(Star):
 
     async def _check_storage_and_notify(self, event: AstrMessageEvent):
         group_id = int(event.get_group_id())
+        bot = self._get_bot()
+        if not bot:
+            logger.warning(f"[{group_id}] 无法执行容量检查，Bot实例不可用。")
+            return
+            
         if group_id not in self.storage_limits:
             return
         try:
-            client = event.bot
+            client = bot
             system_info = await client.api.call_action('get_group_file_system_info', group_id=group_id)
             if not system_info: return
             file_count = system_info.get('file_count', 0)
@@ -370,9 +410,15 @@ class GroupFSPlugin(Star):
     
     @filter.command("sf")
     async def on_search_file_command(self, event: AstrMessageEvent):
-        if not self.bot: self.bot = event.bot
+        # 优先从事件中获取bot实例，并更新本地缓存
+        self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
+        bot = self._get_bot()
+        if not bot:
+            await event.send(MessageChain([Comp.Plain("❌ 无法获取机器人实例，请稍后再试或联系管理员。")]))
+            return
+            
         command_parts = event.message_str.split(maxsplit=2)
         if len(command_parts) < 2 or not command_parts[1]:
             await event.send(MessageChain([Comp.Plain("❓ 请提供要搜索的文件名。用法: /sf <文件名> [序号]")]))
@@ -381,7 +427,7 @@ class GroupFSPlugin(Star):
         index_str = command_parts[2] if len(command_parts) > 2 else None
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /sf, 目标: '{filename_to_find}', 序号: {index_str}")
         
-        all_files = await self._get_all_files_recursive_core(group_id, event.bot)
+        all_files = await self._get_all_files_recursive_core(group_id, bot)
         found_files = []
         for file_info in all_files:
             current_filename = file_info.get('file_name', '')
@@ -425,9 +471,15 @@ class GroupFSPlugin(Star):
             
     @filter.command("df")
     async def on_delete_file_command(self, event: AstrMessageEvent):
-        if not self.bot: self.bot = event.bot
+        # 优先从事件中获取bot实例，并更新本地缓存
+        self.bot = event.bot
         group_id = int(event.get_group_id())
         user_id = int(event.get_sender_id())
+        bot = self._get_bot()
+        if not bot:
+            await event.send(MessageChain([Comp.Plain("❌ 无法获取机器人实例，请稍后再试或联系管理员。")]))
+            return
+
         command_parts = event.message_str.split(maxsplit=2)
         if len(command_parts) < 2 or not command_parts[1]:
             await event.send(MessageChain([Comp.Plain("❓ 请提供要删除的文件名。用法: /df <文件名> [序号]")]))
@@ -439,7 +491,7 @@ class GroupFSPlugin(Star):
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
 
-        all_files = await self._get_all_files_recursive_core(group_id, event.bot)
+        all_files = await self._get_all_files_recursive_core(group_id, bot)
         found_files = []
         for file_info in all_files:
             current_filename = file_info.get('file_name', '')
@@ -487,8 +539,7 @@ class GroupFSPlugin(Star):
                 await event.send(MessageChain([Comp.Plain(f"❌ 找到文件「{found_filename}」，但无法获取其ID，删除失败。")]))
                 return
             logger.info(f"[{group_id}] 确认删除文件 '{found_filename}', File ID: {file_id_to_delete}...")
-            client = event.bot
-            delete_result = await client.api.call_action('delete_group_file', group_id=group_id, file_id=file_id_to_delete)
+            delete_result = await bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id_to_delete)
             is_success = False
             if delete_result:
                 trans_result = delete_result.get('transGroupFileResult', {})
@@ -507,6 +558,11 @@ class GroupFSPlugin(Star):
 
     async def _perform_batch_delete(self, event: AstrMessageEvent, files_to_delete: List[Dict]):
         group_id = int(event.get_group_id())
+        bot = self._get_bot()
+        if not bot:
+            await event.send(MessageChain([Comp.Plain("❌ 无法获取机器人实例，请稍后再试或联系管理员。")]))
+            return
+
         deleted_files = []
         failed_deletions = []
         total_count = len(files_to_delete)
@@ -519,7 +575,7 @@ class GroupFSPlugin(Star):
                 continue
             try:
                 logger.info(f"[{group_id}] [批量删除] ({i+1}/{total_count}) 正在删除 '{file_name}'...")
-                delete_result = await event.bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
+                delete_result = await bot.api.call_action('delete_group_file', group_id=group_id, file_id=file_id)
                 is_success = False
                 if delete_result:
                     trans_result = delete_result.get('transGroupFileResult', {})
@@ -546,7 +602,6 @@ class GroupFSPlugin(Star):
         logger.info(f"[{group_id}] [批量删除] 任务完成，准备发送报告。")
         await self._send_or_forward(event, report_message, name="批量删除报告")
     
-    # === 新增：移植自 file_checker 的压缩包预览辅助函数 ===
     def _get_preview_from_bytes(self, content_bytes: bytes) -> tuple[str, str]:
         """从字节内容中尝试获取文本预览和编码。"""
         try:
@@ -574,7 +629,6 @@ class GroupFSPlugin(Star):
                     zf.setpassword(pwd.encode('utf-8'))
                 txt_files_garbled = sorted([f for f in zf.namelist() if f.lower().endswith('.txt')])
                 if not txt_files_garbled:
-                    # 找不到txt文件时返回None，让外层函数处理
                     return None
                 first_txt_garbled = txt_files_garbled[0]
                 first_txt_fixed = self._fix_zip_filename(first_txt_garbled)
@@ -611,7 +665,6 @@ class GroupFSPlugin(Star):
         extra_info = f"ZIP内文件: {inner_filename} (格式 {encoding})"
         return f"{extra_info}\n{preview_text}", ""
     
-
     async def _get_file_preview(self, event: AstrMessageEvent, file_info: dict) -> tuple[str, str | None]:
         group_id = int(event.get_group_id())
         file_id = file_info.get("file_id")
@@ -629,7 +682,10 @@ class GroupFSPlugin(Star):
         local_file_path = None
         
         try:
-            client = event.bot
+            bot = self._get_bot()
+            if not bot:
+                return "", "❌ 无法获取机器人实例，请稍后再试或联系管理员。"
+            client = bot
             url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
             if not (url_result and url_result.get('url')):
                 return "", f"❌ 无法获取文件「{file_name}」的下载链接。"
