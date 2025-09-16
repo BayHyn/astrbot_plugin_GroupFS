@@ -611,6 +611,7 @@ class GroupFSPlugin(Star):
         extra_info = f"ZIP内文件: {inner_filename} (格式 {encoding})"
         return f"{extra_info}\n{preview_text}", ""
     
+
     async def _get_file_preview(self, event: AstrMessageEvent, file_info: dict) -> tuple[str, str | None]:
         group_id = int(event.get_group_id())
         file_id = file_info.get("file_id")
@@ -627,7 +628,6 @@ class GroupFSPlugin(Star):
         
         local_file_path = None
         
-        # === 新增：添加文件下载链接获取的try-except块，以捕获失效文件错误 ===
         try:
             client = event.bot
             url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
@@ -665,15 +665,21 @@ class GroupFSPlugin(Star):
                         with open(local_file_path, 'wb') as f:
                             f.write(content_bytes)
             
+            preview_content = ""
             if is_txt:
                 decoded_text, _ = self._get_preview_from_bytes(content_bytes)
-                if len(decoded_text) > self.preview_length:
-                    return decoded_text[:self.preview_length] + "...", None
-                return decoded_text, None
+                preview_content = decoded_text
             elif is_zip:
-                # 调用新的 ZIP 预览函数
                 preview_text, error_msg = await self._get_preview_from_zip(local_file_path)
-                return preview_text, error_msg
+                if error_msg:
+                    return "", error_msg
+                preview_content = preview_text
+            
+            # === 核心修改：统一对所有预览文本进行截断 ===
+            if len(preview_content) > self.preview_length:
+                preview_content = preview_content[:self.preview_length] + "..."
+            
+            return preview_content, None
                 
         except asyncio.TimeoutError:
             return "", f"❌ 预览文件「{file_name}」超时。"
