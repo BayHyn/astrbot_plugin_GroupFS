@@ -406,19 +406,14 @@ class GroupFSPlugin(Star):
             file_to_preview = found_files[index - 1]
             preview_text, error_msg = await self._get_file_preview(event, file_to_preview)
             if error_msg:
+                # 预览失败，直接发送错误信息
                 await event.send(MessageChain([Comp.Plain(error_msg)]))
                 return
             
-            # === 新增：如果预览是从ZIP中提取的，则添加额外信息 ===
-            extra_info = ""
-            if len(preview_text.splitlines()) > 1 and preview_text.splitlines()[0].startswith("ZIP内文件"):
-                extra_info, preview_text = preview_text.split("\n", 1)
-                extra_info += "\n"
-            
+            # 预览成功，构建回复消息
             reply_text = (
                 f"📄 文件「{file_to_preview.get('file_name')}」内容预览：\n"
                 + "-" * 20 + "\n"
-                + extra_info
                 + preview_text
             )
             await self._send_or_forward(event, reply_text, name=f"文件预览：{file_to_preview.get('file_name')}")
@@ -572,13 +567,14 @@ class GroupFSPlugin(Star):
             return filename
     
     async def _get_preview_from_zip(self, file_path: str) -> tuple[str, str]:
-        """从本地ZIP文件中解压并预览第一个TXT文件。"""
+        """从本地ZIP文件中解压并预览第一个TXT文件。返回 (预览内容, 错误信息)。"""
         def _try_unzip(pwd: Optional[str] = None) -> Optional[tuple[bytes, str]]:
             with zipfile.ZipFile(file_path, 'r') as zf:
                 if pwd:
                     zf.setpassword(pwd.encode('utf-8'))
                 txt_files_garbled = sorted([f for f in zf.namelist() if f.lower().endswith('.txt')])
                 if not txt_files_garbled:
+                    # 找不到txt文件时返回None，让外层函数处理
                     return None
                 first_txt_garbled = txt_files_garbled[0]
                 first_txt_fixed = self._fix_zip_filename(first_txt_garbled)
@@ -587,26 +583,30 @@ class GroupFSPlugin(Star):
 
         content_bytes, inner_filename = None, None
         try:
-            result = await asyncio.to_thread(_try_unzip) # 在单独的线程中执行I/O操作
-            if result: content_bytes, inner_filename = result
+            result = await asyncio.to_thread(_try_unzip)
+            if result:
+                content_bytes, inner_filename = result
         except RuntimeError:
-            if self.default_zip_password:
-                logger.info(f"无密码解压 '{os.path.basename(file_path)}' 失败，尝试使用默认密码...")
-                try:
+            logger.info(f"无密码解压 '{os.path.basename(file_path)}' 失败，尝试使用默认密码...")
+            try:
+                if self.default_zip_password:
                     result = await asyncio.to_thread(_try_unzip, self.default_zip_password)
-                    if result: content_bytes, inner_filename = result
-                except Exception as e:
-                    logger.error(f"使用默认密码解压失败: {e}")
-                    return "", ""
-            else:
-                return "", ""
+                    if result:
+                        content_bytes, inner_filename = result
+                    else:
+                        return "", "压缩包中没有可预览的文本文件"
+                else:
+                    return "", "文件已加密，未提供解压密码"
+            except Exception as e:
+                logger.error(f"使用默认密码解压失败: {e}")
+                return "", "解压失败"
         except Exception as e:
             logger.error(f"处理ZIP文件时发生未知错误: {e}")
-            return "", ""
+            return "", "处理ZIP文件时发生未知错误"
 
         if not content_bytes:
-            return "", ""
-        
+            return "", "压缩包中没有可预览的文本文件"
+
         preview_text, encoding = self._get_preview_from_bytes(content_bytes)
         extra_info = f"ZIP内文件: {inner_filename} (格式 {encoding})"
         return f"{extra_info}\n{preview_text}", ""
@@ -626,13 +626,26 @@ class GroupFSPlugin(Star):
         logger.info(f"[{group_id}] 正在为文件 '{file_name}' (ID: {file_id}) 获取预览...")
         
         local_file_path = None
+        
+        # === 新增：添加文件下载链接获取的try-except块，以捕获失效文件错误 ===
         try:
             client = event.bot
             url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
             if not (url_result and url_result.get('url')):
                 return "", f"❌ 无法获取文件「{file_name}」的下载链接。"
             url = url_result['url']
-            
+        except ActionFailed as e:
+            if e.result.get('retcode') == 1200:
+                error_message = (
+                    f"❌ 预览文件「{file_name}」失败：\n"
+                    f"该文件可能已失效或被服务器清理。\n"
+                    f"建议使用 /df {os.path.splitext(file_name)[0]} 将其删除。"
+                )
+                return "", error_message
+            else:
+                return "", f"❌ 预览失败，API返回错误：{e.result.get('wording', '未知错误')}"
+        
+        try:
             async with aiohttp.ClientSession() as session:
                 async with self.download_semaphore:
                     # 对于ZIP文件，需要下载完整文件，因为可能需要密码解压
@@ -662,16 +675,6 @@ class GroupFSPlugin(Star):
                 preview_text, error_msg = await self._get_preview_from_zip(local_file_path)
                 return preview_text, error_msg
                 
-        except ActionFailed as e:
-            if e.result.get('retcode') == 1200:
-                error_message = (
-                    f"❌ 预览文件「{file_name}」失败：\n"
-                    f"该文件可能已失效或被服务器清理。\n"
-                    f"建议使用 /df {os.path.splitext(file_name)[0]} 将其删除。"
-                )
-                return "", error_message
-            else:
-                return "", f"❌ 预览失败，API返回错误：{e.result.get('wording', '未知错误')}"
         except asyncio.TimeoutError:
             return "", f"❌ 预览文件「{file_name}」超时。"
         except Exception as e:
