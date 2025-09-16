@@ -17,6 +17,18 @@
         "type": "int",
         "default": 300
     },
+    "enable_zip_preview": {
+        "description": "启用ZIP压缩包预览",
+        "hint": "开启后，使用 /sf ... <序号> 可预览ZIP包内第一个TXT文件的内容。",
+        "type": "bool",
+        "default": true
+    },
+    "default_zip_password": {
+        "description": "默认ZIP解压密码",
+        "hint": "在预览加密的ZIP压缩包时，会尝试使用此密码进行解压。",
+        "type": "str",
+        "default": ""
+    },
     "storage_limits": {
         "description": "群文件容量监控阈值 (列表)",
         "hint": "格式为 \"群号:文件数量上限:空间上限GB\"，例如 \"123456:1000:9.5\"。当任一数值达到上限时，上传文件会触发提醒。",
