@@ -26,7 +26,7 @@ from . import utils
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.7",
+    "0.8",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -675,7 +675,6 @@ class GroupFSPlugin(Star):
                     return "", error_msg
                 preview_content = preview_text
             
-            # === 核心修改：统一对所有预览文本进行截断 ===
             if len(preview_content) > self.preview_length:
                 preview_content = preview_content[:self.preview_length] + "..."
             
