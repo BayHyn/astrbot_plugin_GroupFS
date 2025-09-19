@@ -41,6 +41,12 @@
         "type": "list",
         "default": []
     },
+    "scheduled_autodelete": {
+        "description": "定时任务自动删除失效文件",
+        "hint": "开启后，定时任务检测到失效文件将直接删除，而不是只发送报告。默认只报告，不删除。",
+        "type": "bool",
+        "default": false
+    },
     "forward_threshold": {
         "description": "长消息合并转发阈值 (字符)",
         "hint": "当插件的单条回复超过此字数时，将自动转为合并转发。设置为 0 则禁用此功能。",
