@@ -1,12 +1,12 @@
 # astrbot_plugin_GroupFS/main.py
 
-# 请确保已安装依赖: pip install croniter aiohttp chardet
 import asyncio
 import os
 import datetime
+import time
 from typing import List, Dict, Optional
-import zipfile
 import chardet
+import subprocess
 
 import aiohttp
 import croniter
@@ -127,7 +127,6 @@ class GroupFSPlugin(Star):
                             continue
                         logger.info(f"[{group_id}] [定时任务] Cron 表达式 '{cron_str}' 已触发，开始执行。")
                         self.running_tasks.add(task_key)
-                        # 调用统一的检查函数，根据配置决定是否删除
                         task = asyncio.ensure_future(self._perform_scheduled_check(group_id, self.scheduled_autodelete))
                         task.add_done_callback(lambda t, key=task_key: self.running_tasks.remove(key))
             
@@ -136,7 +135,7 @@ class GroupFSPlugin(Star):
     async def _perform_scheduled_check(self, group_id: int, auto_delete: bool):
         """统一的定时检查函数，根据auto_delete决定是否删除。"""
         log_prefix = "[定时任务-自动清理]" if auto_delete else "[定时任务-仅检查]"
-        report_title = "定时检查报告 (已自动清理)" if auto_delete else "定时检查报告"
+        report_title = "定时清理报告" if auto_delete else "定时检查报告"
         
         try:
             if not self.bot:
@@ -163,7 +162,6 @@ class GroupFSPlugin(Star):
                     except ActionFailed as e:
                         if e.result.get('retcode') == 1200:
                             invalid_files_info.append(file_info)
-                            # 如果开启了自动删除，则尝试删除
                             if auto_delete:
                                 logger.warning(f"[{group_id}] {log_prefix} 发现失效文件 '{file_name}'，尝试删除...")
                                 try:
@@ -182,45 +180,44 @@ class GroupFSPlugin(Star):
                                     failed_deletions.append(file_name)
                     await asyncio.sleep(0.2)
             
-            # 构建报告消息
-            report_message = f"🚨 {report_title}\n在 {total_count} 个群文件中，"
             if not invalid_files_info:
-                report_message += "未发现任何失效文件。"
+                logger.info(f"[{group_id}] {log_prefix} 检查完成，未发现失效文件。")
+                return 
+
+            report_message = f"🚨 {report_title}\n在 {total_count} 个群文件中，"
+            report_message += f"共发现 {len(invalid_files_info)} 个失效文件。\n"
+            
+            if auto_delete:
+                report_message += f"\n- 成功删除: {len(deleted_files)} 个"
+                if failed_deletions:
+                    report_message += f"\n- 删除失败: {len(failed_deletions)} 个"
+                if not deleted_files and not failed_deletions:
+                     report_message += f"但未成功删除任何文件。"
+                
+                report_message += "\n" + "-" * 20
+                for info in invalid_files_info:
+                    status = "已删除" if info.get('file_name') in deleted_files else "删除失败"
+                    folder_name = info.get('parent_folder_name', '未知')
+                    modify_time = utils.format_timestamp(info.get('modify_time'))
+                    report_message += f"\n- {info.get('file_name')} ({status})"
+                    report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
             else:
-                report_message += f"共发现 {len(invalid_files_info)} 个失效文件。\n"
-                if auto_delete:
-                    report_message += f"\n- 成功删除: {len(deleted_files)} 个"
-                    if failed_deletions:
-                        report_message += f"\n- 删除失败: {len(failed_deletions)} 个"
-                    if not deleted_files and not failed_deletions:
-                         report_message += f"**但未成功删除任何文件**。"
-                    report_message += "\n" + "-" * 20
-                    for info in invalid_files_info:
-                        if info.get('file_name') in deleted_files:
-                            status = "已删除"
-                        elif info.get('file_name') in failed_deletions:
-                            status = "删除失败"
-                        else:
-                            status = "未知状态"
-                        
-                        folder_name = info.get('parent_folder_name', '未知')
-                        modify_time = utils.format_timestamp(info.get('modify_time'))
-                        report_message += f"\n- {info.get('file_name')} ({status})"
-                        report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
-                else:
-                    report_message += "\n" + "-" * 20
-                    for info in invalid_files_info:
-                        folder_name = info.get('parent_folder_name', '未知')
-                        modify_time = utils.format_timestamp(info.get('modify_time'))
-                        report_message += f"\n- {info.get('file_name')}"
-                        report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
-                    report_message += "\n" + "-" * 20
-                    report_message += "\n建议管理员使用 /cdf 指令进行一键清理。"
+                report_message += "\n" + "-" * 20
+                for info in invalid_files_info:
+                    folder_name = info.get('parent_folder_name', '未知')
+                    modify_time = utils.format_timestamp(info.get('modify_time'))
+                    report_message += f"\n- {info.get('file_name')}"
+                    report_message += f"\n  (文件夹: {folder_name} | 时间: {modify_time})"
+                report_message += "\n" + "-" * 20
+                report_message += "\n建议管理员使用 /cdf 指令进行一键清理。"
             
             logger.info(f"[{group_id}] {log_prefix} 检查全部完成，准备发送报告。")
             await bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
         except Exception as e:
             logger.error(f"[{group_id}] {log_prefix} 执行过程中发生未知异常: {e}", exc_info=True)
+            if self.bot:
+                await self.bot.api.call_action('send_group_msg', group_id=group_id, message="❌ 定时任务执行过程中发生内部错误，请检查后台日志。")
+
 
     async def _get_all_files_recursive_core(self, group_id: int, bot) -> List[Dict]:
         all_files = []
@@ -563,8 +560,7 @@ class GroupFSPlugin(Star):
             report_message += "\n".join(f"- {name}" for name in failed_deletions)
         logger.info(f"[{group_id}] [批量删除] 任务完成，准备发送报告。")
         await self._send_or_forward(event, report_message, name="批量删除报告")
-    
-    # === 新增：移植自 file_checker 的压缩包预览辅助函数 ===
+
     def _get_preview_from_bytes(self, content_bytes: bytes) -> tuple[str, str]:
         """从字节内容中尝试获取文本预览和编码。"""
         try:
@@ -577,58 +573,101 @@ class GroupFSPlugin(Star):
         except Exception:
             return "", "未知"
 
-    def _fix_zip_filename(self, filename: str) -> str:
-        """修复ZIP文件中的乱码文件名。"""
-        try:
-            return filename.encode('cp437').decode('gbk')
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return filename
-    
     async def _get_preview_from_zip(self, file_path: str) -> tuple[str, str]:
-        """从本地ZIP文件中解压并预览第一个TXT文件。返回 (预览内容, 错误信息)。"""
-        def _try_unzip(pwd: Optional[str] = None) -> Optional[tuple[bytes, str]]:
-            with zipfile.ZipFile(file_path, 'r') as zf:
-                if pwd:
-                    zf.setpassword(pwd.encode('utf-8'))
-                txt_files_garbled = sorted([f for f in zf.namelist() if f.lower().endswith('.txt')])
-                if not txt_files_garbled:
-                    # 找不到txt文件时返回None，让外层函数处理
-                    return None
-                first_txt_garbled = txt_files_garbled[0]
-                first_txt_fixed = self._fix_zip_filename(first_txt_garbled)
-                content_bytes = zf.read(first_txt_garbled)
-                return content_bytes, first_txt_fixed
-
-        content_bytes, inner_filename = None, None
+        """从本地压缩文件中解压并预览第一个文本文件。返回 (预览内容, 错误信息)。
+           使用 7za 命令来支持更多格式。
+        """
+        temp_dir = os.path.join(os.getcwd(), 'temp_file_previews')
+        os.makedirs(temp_dir, exist_ok=True)
+        extract_path = os.path.join(temp_dir, f"extract_{int(time.time())}")
+        os.makedirs(extract_path, exist_ok=True)
+        
+        preview_text = ""
+        error_msg = None
+        
         try:
-            result = await asyncio.to_thread(_try_unzip)
-            if result:
-                content_bytes, inner_filename = result
-        except RuntimeError:
-            logger.info(f"无密码解压 '{os.path.basename(file_path)}' 失败，尝试使用默认密码...")
-            try:
+            # 第一次尝试：无密码解压
+            logger.info(f"正在尝试无密码解压文件 '{os.path.basename(file_path)}'...")
+            command_no_pwd = ["7za", "x", file_path, f"-o{extract_path}", "-y"]
+            process = await asyncio.create_subprocess_exec(
+                *command_no_pwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                # 第一次尝试失败，检查是否有默认密码
                 if self.default_zip_password:
-                    result = await asyncio.to_thread(_try_unzip, self.default_zip_password)
-                    if result:
-                        content_bytes, inner_filename = result
-                    else:
-                        return "", "压缩包中没有可预览的文本文件"
+                    logger.info("无密码解压失败，正在尝试使用默认密码...")
+                    # 第二次尝试：使用默认密码解压
+                    command_with_pwd = ["7za", "x", file_path, f"-o{extract_path}", f"-p{self.default_zip_password}", "-y"]
+                    process = await asyncio.create_subprocess_exec(
+                        *command_with_pwd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        error_msg = stderr.decode('utf-8').strip()
+                        logger.error(f"使用默认密码解压失败: {error_msg}")
+                        error_msg = "解压失败，可能密码不正确"
                 else:
-                    return "", "文件已加密，未提供解压密码"
-            except Exception as e:
-                logger.error(f"使用默认密码解压失败: {e}")
-                return "", "解压失败"
+                    error_msg = stderr.decode('utf-8').strip()
+                    logger.error(f"使用 7za 命令解压失败且未设置默认密码: {error_msg}")
+                    error_msg = "解压失败，可能文件已加密"
+            
+            if error_msg:
+                return "", error_msg
+
+            # 成功解压后，查找第一个可预览的文本文件
+            all_extracted_files = [os.path.join(dirpath, f) for dirpath, _, filenames in os.walk(extract_path) for f in filenames]
+            preview_file_path = None
+            
+            # 优先查找txt文件
+            for f_path in all_extracted_files:
+                if f_path.lower().endswith('.txt'):
+                    preview_file_path = f_path
+                    break
+            
+            if not preview_file_path:
+                return "", "压缩包中没有可预览的文本文件"
+            
+            with open(preview_file_path, 'rb') as f:
+                content_bytes = f.read(4096)
+            
+            preview_text_raw, encoding = self._get_preview_from_bytes(content_bytes)
+            
+            inner_file_name = os.path.relpath(preview_file_path, extract_path)
+            extra_info = f"已解压「{inner_file_name}」(格式 {encoding})"
+            preview_text = f"{extra_info}\n{preview_text_raw}"
+            
+        except FileNotFoundError:
+            logger.error("解压失败：容器内未找到 7za 命令。请安装 p7zip-full。")
+            error_msg = "解压失败：未安装 7za"
         except Exception as e:
-            logger.error(f"处理ZIP文件时发生未知错误: {e}")
-            return "", "处理ZIP文件时发生未知错误"
+            logger.error(f"处理ZIP文件时发生未知错误: {e}", exc_info=True)
+            error_msg = "处理压缩文件时发生内部错误"
+        finally:
+            if os.path.exists(extract_path):
+                asyncio.create_task(self._cleanup_folder(extract_path))
+        
+        return preview_text, error_msg
 
-        if not content_bytes:
-            return "", "压缩包中没有可预览的文本文件"
-
-        preview_text, encoding = self._get_preview_from_bytes(content_bytes)
-        extra_info = f"ZIP内文件: {inner_filename} (格式 {encoding})"
-        return f"{extra_info}\n{preview_text}", ""
-    
+    async def _cleanup_folder(self, path: str):
+        """异步清理文件夹及其内容。"""
+        await asyncio.sleep(5)
+        try:
+            for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+                for filename in filenames:
+                    os.remove(os.path.join(dirpath, filename))
+                for dirname in dirnames:
+                    os.rmdir(os.path.join(dirpath, dirname))
+            os.rmdir(path)
+            logger.info(f"已清理临时文件夹: {path}")
+        except OSError as e:
+            logger.warning(f"删除临时文件夹 {path} 失败: {e}")
 
     async def _get_file_preview(self, event: AstrMessageEvent, file_info: dict) -> tuple[str, str | None]:
         group_id = int(event.get_group_id())
@@ -640,7 +679,7 @@ class GroupFSPlugin(Star):
         is_zip = self.enable_zip_preview and file_extension.lower() == '.zip'
         
         if not (is_txt or is_zip):
-            return "", f"❌ 文件「{file_name}」不是支持的文本或ZIP格式，无法预览。"
+            return "", f"❌ 文件「{file_name}」不是支持的文本或压缩格式，无法预览。"
             
         logger.info(f"[{group_id}] 正在为文件 '{file_name}' (ID: {file_id}) 获取预览...")
         
@@ -682,6 +721,7 @@ class GroupFSPlugin(Star):
                             f.write(content_bytes)
             
             preview_content = ""
+            error_msg = None
             if is_txt:
                 decoded_text, _ = self._get_preview_from_bytes(content_bytes)
                 preview_content = decoded_text
