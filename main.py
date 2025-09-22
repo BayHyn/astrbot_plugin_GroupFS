@@ -1,12 +1,13 @@
 # astrbot_plugin_GroupFS/main.py
 
+# 请确保已安装依赖: pip install croniter aiohttp chardet apscheduler
 import asyncio
 import os
-import datetime
 import time
 from typing import List, Dict, Optional
 import chardet
 import subprocess
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import aiohttp
 import croniter
@@ -19,7 +20,6 @@ from astrbot.api.message_components import Node
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
 
-# 从 utils.py 导入辅助函数和常量
 from . import utils
 
 @register(
@@ -37,24 +37,19 @@ class GroupFSPlugin(Star):
         self.admin_users: List[int] = [int(u) for u in self.config.get("admin_users", [])]
         self.preview_length: int = self.config.get("preview_length", 300)
         self.storage_limits: Dict[int, Dict] = {}
-        self.cron_tasks = []
-        self.last_cron_check_time: Dict[str, datetime.datetime] = {}
+        self.cron_configs = []
         self.bot = None
         self.forward_threshold: int = self.config.get("forward_threshold", 0)
-        self.running_tasks = set()
-        self.scheduler_lock = asyncio.Lock()
+        self.scheduler: Optional[AsyncIOScheduler] = None
         
-        # 新增：用于跟踪所有由插件创建的异步任务
         self.active_tasks = [] 
         
         self.enable_zip_preview: bool = self.config.get("enable_zip_preview", False)
         self.default_zip_password: str = self.config.get("default_zip_password", "")
         self.download_semaphore = asyncio.Semaphore(5)
         
-        # 新增配置项
         self.scheduled_autodelete: bool = self.config.get("scheduled_autodelete", False)
 
-        # 解析容量监控配置
         limit_configs = self.config.get("storage_limits", [])
         for item in limit_configs:
             try:
@@ -64,7 +59,6 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         
-        # 解析定时任务配置，并进行去重
         cron_configs = self.config.get("scheduled_check_tasks", [])
         seen_tasks = set()
         for item in cron_configs:
@@ -74,14 +68,12 @@ class GroupFSPlugin(Star):
                 if not croniter.croniter.is_valid(cron_str):
                     raise ValueError(f"无效的 cron 表达式: {cron_str}")
                 
-                # 使用元组作为去重依据
                 task_identifier = (group_id, cron_str)
                 if task_identifier in seen_tasks:
                     logger.warning(f"检测到重复的定时任务配置 '{item}'，已跳过。")
                     continue
                 
-                task_key = f"{group_id}:{cron_str}"
-                self.cron_tasks.append((task_key, group_id, cron_str))
+                self.cron_configs.append({"group_id": group_id, "cron_str": cron_str})
                 seen_tasks.add(task_identifier)
             except ValueError as e:
                 logger.error(f"解析 scheduled_check_tasks 配置 '{item}' 时出错: {e}，已跳过。")
@@ -95,9 +87,41 @@ class GroupFSPlugin(Star):
         else:
             logger.warning("[初始化] 未能从 context 中直接获取 bot 实例，将依赖指令触发来捕获。")
 
-        if self.cron_tasks:
-            logger.info("[定时任务] 启动失效文件检查循环...")
-            self.active_tasks.append(asyncio.create_task(self.scheduled_check_loop()))
+        if self.cron_configs:
+            logger.info("[定时任务] 启动失效文件检查调度器...")
+            self.scheduler = AsyncIOScheduler()
+            self._register_jobs()
+            self.scheduler.start()
+
+    def _register_jobs(self):
+        """根据配置注册定时任务"""
+        for job_config in self.cron_configs:
+            group_id = job_config["group_id"]
+            cron_str = job_config["cron_str"]
+            job_id = f"scheduled_check_{group_id}_{cron_str.replace(' ', '_')}"
+            
+            if self.scheduler.get_job(job_id):
+                logger.warning(f"任务 {job_id} 已存在，跳过注册。")
+                continue
+            
+            try:
+                cron_parts = cron_str.split()
+                minute, hour, day, month, day_of_week = cron_parts
+                
+                self.scheduler.add_job(
+                    self._perform_scheduled_check,
+                    "cron",
+                    args=[group_id, self.scheduled_autodelete],
+                    minute=minute,
+                    hour=hour,
+                    day=day,
+                    month=month,
+                    day_of_week=day_of_week,
+                    id=job_id
+                )
+                logger.info(f"成功注册定时任务: group_id={group_id}, cron_str='{cron_str}'")
+            except Exception as e:
+                logger.error(f"注册定时任务 '{cron_str}' 失败: {e}", exc_info=True)
 
     async def _send_or_forward(self, event: AstrMessageEvent, text: str, name: str = "GroupFS"):
         if self.forward_threshold > 0 and len(text) > self.forward_threshold:
@@ -111,26 +135,6 @@ class GroupFSPlugin(Star):
                 await event.send(MessageChain([Comp.Plain(text[:self.forward_threshold] + "... (消息过长且合并转发失败)")]))
         else:
             await event.send(MessageChain([Comp.Plain(text)]))
-
-    async def scheduled_check_loop(self):
-        now = datetime.datetime.now()
-        await asyncio.sleep(60 - now.second)
-        
-        while True:
-            now_aligned = datetime.datetime.now().replace(second=0, microsecond=0)
-            
-            async with self.scheduler_lock:
-                for task_key, group_id, cron_str in self.cron_tasks:
-                    if croniter.croniter.match(cron_str, now_aligned):
-                        if task_key in self.running_tasks:
-                            logger.warning(f"[{group_id}] [定时任务] 检测到上一个任务 '{task_key}' 仍在运行，本次触发已跳过。")
-                            continue
-                        logger.info(f"[{group_id}] [定时任务] Cron 表达式 '{cron_str}' 已触发，开始执行。")
-                        self.running_tasks.add(task_key)
-                        task = asyncio.ensure_future(self._perform_scheduled_check(group_id, self.scheduled_autodelete))
-                        task.add_done_callback(lambda t, key=task_key: self.running_tasks.remove(key))
-            
-            await asyncio.sleep(60)
 
     async def _perform_scheduled_check(self, group_id: int, auto_delete: bool):
         """统一的定时检查函数，根据auto_delete决定是否删除。"""
@@ -212,7 +216,8 @@ class GroupFSPlugin(Star):
                 report_message += "\n建议管理员使用 /cdf 指令进行一键清理。"
             
             logger.info(f"[{group_id}] {log_prefix} 检查全部完成，准备发送报告。")
-            await bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
+            if self.bot:
+                await self.bot.api.call_action('send_group_msg', group_id=group_id, message=report_message)
         except Exception as e:
             logger.error(f"[{group_id}] {log_prefix} 执行过程中发生未知异常: {e}", exc_info=True)
             if self.bot:
@@ -327,7 +332,6 @@ class GroupFSPlugin(Star):
             return
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
         await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
-        # 传递auto_delete=False给_perform_scheduled_check
         self.active_tasks.append(asyncio.create_task(self._perform_scheduled_check(group_id, False)))
         event.stop_event()
     
@@ -551,7 +555,7 @@ class GroupFSPlugin(Star):
             await asyncio.sleep(0.5)
         report_message = f"✅ 批量删除完成！\n共处理了 {total_count} 个文件。\n\n"
         if deleted_files:
-            report_message += f"成功删除了 {len(deleted_files)} 个文件：\n"
+            report_message += f"成功删除了 {len(deleted_files)} 个失效文件：\n"
             report_message += "\n".join(f"- {name}" for name in deleted_files)
         else:
             report_message += "未能成功删除任何文件。"
@@ -586,7 +590,6 @@ class GroupFSPlugin(Star):
         error_msg = None
         
         try:
-            # 第一次尝试：无密码解压
             logger.info(f"正在尝试无密码解压文件 '{os.path.basename(file_path)}'...")
             command_no_pwd = ["7za", "x", file_path, f"-o{extract_path}", "-y"]
             process = await asyncio.create_subprocess_exec(
@@ -597,10 +600,8 @@ class GroupFSPlugin(Star):
             stdout, stderr = await process.communicate()
             
             if process.returncode != 0:
-                # 第一次尝试失败，检查是否有默认密码
                 if self.default_zip_password:
                     logger.info("无密码解压失败，正在尝试使用默认密码...")
-                    # 第二次尝试：使用默认密码解压
                     command_with_pwd = ["7za", "x", file_path, f"-o{extract_path}", f"-p{self.default_zip_password}", "-y"]
                     process = await asyncio.create_subprocess_exec(
                         *command_with_pwd,
@@ -621,11 +622,9 @@ class GroupFSPlugin(Star):
             if error_msg:
                 return "", error_msg
 
-            # 成功解压后，查找第一个可预览的文本文件
             all_extracted_files = [os.path.join(dirpath, f) for dirpath, _, filenames in os.walk(extract_path) for f in filenames]
             preview_file_path = None
             
-            # 优先查找txt文件
             for f_path in all_extracted_files:
                 if f_path.lower().endswith('.txt'):
                     preview_file_path = f_path
@@ -695,7 +694,7 @@ class GroupFSPlugin(Star):
             if e.result.get('retcode') == 1200:
                 error_message = (
                     f"❌ 预览文件「{file_name}」失败：\n"
-                    f"该文件可能已失效或被服务器清理。\n"
+                    f"该文件可能已失效。\n"
                     f"建议使用 /df {os.path.splitext(file_name)[0]} 将其删除。"
                 )
                 return "", error_message
