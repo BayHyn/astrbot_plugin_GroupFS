@@ -16,7 +16,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
-from astrbot.api.message_components import Node
+from astrbot.api.message_components import Plain, Node, Nodes
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
 
@@ -123,18 +123,44 @@ class GroupFSPlugin(Star):
             except Exception as e:
                 logger.error(f"注册定时任务 '{cron_str}' 失败: {e}", exc_info=True)
 
+    def _split_text_by_length(self, text: str, max_length: int = 1000) -> List[str]:
+            """
+            将文本按指定长度分割成一个字符串列表。
+            """
+            return [text[i:i + max_length] for i in range(0, len(text), max_length)]
+
     async def _send_or_forward(self, event: AstrMessageEvent, text: str, name: str = "GroupFS"):
-        if self.forward_threshold > 0 and len(text) > self.forward_threshold:
-            group_id = event.get_group_id()
-            logger.info(f"[{group_id}] 检测到长消息 (长度: {len(text)} > {self.forward_threshold})，将自动合并转发。")
+        total_length = len(text)
+        group_id = event.get_group_id()
+
+        if self.forward_threshold > 0 and total_length > self.forward_threshold:
+            logger.info(f"[{group_id}] 检测到长消息 (长度: {total_length} > {self.forward_threshold})，准备自动合并转发。")
             try:
-                forward_node = Node(uin=event.get_self_id(), name=name, content=[Comp.Plain(text)])
-                await event.send(MessageChain([forward_node]))
+                split_texts = self._split_text_by_length(text, 4000)
+                forward_nodes = []
+                
+                logger.info(f"[{group_id}] 将消息分割为 {len(split_texts)} 个节点。")
+                for i, part_text in enumerate(split_texts):
+                    node_name = f"{name} ({i+1})" if len(split_texts) > 1 else name
+                    forward_nodes.append(Node(uin=event.get_self_id(), name=node_name, content=[Plain(part_text)]))
+
+                merged_forward_message = Nodes(nodes=forward_nodes)
+                await event.send(MessageChain([merged_forward_message]))
+                logger.info(f"[{group_id}] 成功发送合并转发消息。")
+
             except Exception as e:
                 logger.error(f"[{group_id}] 合并转发长消息时出错: {e}", exc_info=True)
-                await event.send(MessageChain([Comp.Plain(text[:self.forward_threshold] + "... (消息过长且合并转发失败)")]))
+                
+                fallback_text = text[:self.forward_threshold] + "... (消息过长且合并转发失败)"
+                await event.send(MessageChain([Comp.Plain(fallback_text)]))
+                logger.info(f"[{group_id}] 合并转发失败，已回退为发送截断的普通消息。")
         else:
-            await event.send(MessageChain([Comp.Plain(text)]))
+            logger.info(f"[{group_id}] 消息长度未达阈值 ({total_length} <= {self.forward_threshold})，直接发送普通消息。")
+            try:
+                await event.send(MessageChain([Comp.Plain(text)]))
+                logger.info(f"[{group_id}] 成功发送普通消息。")
+            except Exception as e:
+                logger.error(f"[{group_id}] 发送普通消息时出错: {e}", exc_info=True)
 
     async def _perform_scheduled_check(self, group_id: int, auto_delete: bool):
         """统一的定时检查函数，根据auto_delete决定是否删除。"""
@@ -634,7 +660,7 @@ class GroupFSPlugin(Star):
                 return "", "压缩包中没有可预览的文本文件"
             
             with open(preview_file_path, 'rb') as f:
-                content_bytes = f.read(4096)
+                content_bytes = f.read(self.preview_length * 4)
             
             preview_text_raw, encoding = self._get_preview_from_bytes(content_bytes)
             
@@ -706,7 +732,8 @@ class GroupFSPlugin(Star):
                 async with self.download_semaphore:
                     range_header = None
                     if is_txt:
-                        range_header = {'Range': 'bytes=0-4095'}
+                        read_bytes_limit = self.preview_length * 4
+                        range_header = {'Range': f'bytes=0-{read_bytes_limit - 1}'}
                     async with session.get(url, headers=range_header, timeout=30) as resp:
                         if resp.status != 200 and resp.status != 206:
                             return "", f"❌ 下载文件「{file_name}」失败 (HTTP: {resp.status})。"
