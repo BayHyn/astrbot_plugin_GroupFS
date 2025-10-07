@@ -7,7 +7,7 @@
     },
     "admin_users": {
         "description": "管理员QQ列表",
-        "hint": "只有在此列表中的用户才有权限使用 /df 等管理指令。为了安全，强烈建议配置此项！",
+        "hint": "只有在此列表中的用户才有权限使用 /df, /gfb 等管理指令。为了安全，强烈建议配置此项！",
         "type": "list",
         "default": []
     },
@@ -52,5 +52,23 @@
         "hint": "当插件的单条回复超过此字数时，将自动转为合并转发。设置为 0 则禁用此功能。",
         "type": "int",
         "default": 0
+    },
+    "backup_zip_password": {
+        "description": "备份压缩包加密密码",
+        "hint": "使用 /gfb 指令备份文件时，生成的ZIP压缩包将使用此密码加密。留空则不加密。",
+        "type": "string",
+        "default": ""
+    },
+    "backup_file_size_limit_mb": {
+        "description": "单文件备份大小上限 (MB)",
+        "hint": "超过此大小的群文件将跳过备份。设置为 0 或不填则表示无限制。",
+        "type": "int",
+        "default": 0
+    },
+    "backup_file_extensions": {
+        "description": "允许备份的文件扩展名",
+        "hint": "只有在列表中的文件类型才会被备份。用逗号分隔，如: txt,pdf,jpg",
+        "type": "text",
+        "default": "txt,zip" 
     }
 }

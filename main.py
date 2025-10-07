@@ -19,6 +19,7 @@ import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Plain, Node, Nodes
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from aiocqhttp.exceptions import ActionFailed
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path 
 
 from . import utils
 
@@ -26,7 +27,7 @@ from . import utils
     "astrbot_plugin_GroupFS",
     "Foolllll",
     "管理QQ群文件",
-    "0.8",
+    "0.8.1",
     "https://github.com/Foolllll-J/astrbot_plugin_GroupFS"
 )
 class GroupFSPlugin(Star):
@@ -59,6 +60,16 @@ class GroupFSPlugin(Star):
             except ValueError as e:
                 logger.error(f"解析 storage_limits 配置 '{item}' 时出错: {e}，已跳过。")
         
+        self.backup_zip_password: str = self.config.get("backup_zip_password", "")
+        self.backup_file_size_limit_mb: int = self.config.get("backup_file_size_limit_mb", 0)
+        ext_str: str = self.config.get("backup_file_extensions", "txt,zip")
+        
+        self.backup_file_extensions: List[str] = [
+            ext.strip().lstrip('.').lower()
+            for ext in ext_str.split(',') 
+            if ext.strip()
+        ]
+
         cron_configs = self.config.get("scheduled_check_tasks", [])
         seen_tasks = set()
         for item in cron_configs:
@@ -81,12 +92,6 @@ class GroupFSPlugin(Star):
         logger.info("插件 [群文件系统GroupFS] 已加载。")
 
     async def initialize(self):
-        if hasattr(self.context, "bot") and self.context.bot:
-            self.bot = self.context.bot
-            logger.info("[初始化] 成功从 context 中获取 bot 实例。")
-        else:
-            logger.warning("[初始化] 未能从 context 中直接获取 bot 实例，将依赖指令触发来捕获。")
-
         if self.cron_configs:
             logger.info("[定时任务] 启动失效文件检查调度器...")
             self.scheduler = AsyncIOScheduler()
@@ -165,7 +170,7 @@ class GroupFSPlugin(Star):
     async def _perform_scheduled_check(self, group_id: int, auto_delete: bool):
         """统一的定时检查函数，根据auto_delete决定是否删除。"""
         log_prefix = "[定时任务-自动清理]" if auto_delete else "[定时任务-仅检查]"
-        report_title = "定时清理报告" if auto_delete else "定时检查报告"
+        report_title = "清理报告" if auto_delete else "检查报告"
         
         try:
             if not self.bot:
@@ -250,30 +255,197 @@ class GroupFSPlugin(Star):
                 await self.bot.api.call_action('send_group_msg', group_id=group_id, message="❌ 定时任务执行过程中发生内部错误，请检查后台日志。")
 
 
-    async def _get_all_files_recursive_core(self, group_id: int, bot) -> List[Dict]:
+    async def _get_all_files_with_path(self, group_id: int, bot) -> List[Dict]:
+        """递归获取所有文件，并计算其在备份目录中的相对路径。"""
         all_files = []
-        folders_to_scan = [(None, "根目录")]
+        # 结构: (folder_id, folder_name, relative_path)
+        folders_to_scan = [(None, "根目录", "")] 
         while folders_to_scan:
-            current_folder_id, current_folder_name = folders_to_scan.pop(0)
+            current_folder_id, current_folder_name, current_relative_path = folders_to_scan.pop(0)
+            
             try:
-                if current_folder_id is None:
+                if current_folder_id is None or current_folder_id == '/':
                     result = await bot.api.call_action('get_group_root_files', group_id=group_id, file_count=2000)
                 else:
                     result = await bot.api.call_action('get_group_files_by_folder', group_id=group_id, folder_id=current_folder_id, file_count=2000)
+                
                 if not result: continue
+                
                 if result.get('files'):
                     for file_info in result['files']:
-                        file_info['parent_folder_name'] = current_folder_name
+                        file_info['relative_path'] = os.path.join(current_relative_path, file_info.get('file_name', ''))
+                        file_info['size'] = file_info.get('size', 0) # 确保有 size 字段
                         all_files.append(file_info)
+                        
                 if result.get('folders'):
                     for folder in result['folders']:
                         if folder_id := folder.get('folder_id'):
-                            folders_to_scan.append((folder_id, folder.get('folder_name')))
+                            new_relative_path = os.path.join(current_relative_path, folder.get('folder_name', ''))
+                            folders_to_scan.append((folder_id, folder.get('folder_name', ''), new_relative_path))
+                            
             except Exception as e:
-                logger.error(f"[{group_id}] 递归获取文件夹 '{current_folder_name}' 内容时出错: {e}")
+                logger.error(f"[{group_id}-群文件遍历] 递归获取文件夹 '{current_folder_name}' 内容时出错: {e}")
                 continue
         return all_files
+        
+    async def _get_all_files_recursive_core(self, group_id: int, bot) -> List[Dict]:
+        """
+        兼容 /cdf, /cf, /sf, /df 等指令。
+        """
+        all_files_with_path = await self._get_all_files_with_path(group_id, bot)
+        for file_info in all_files_with_path:
+            path_parts = file_info.get('relative_path', '').split(os.path.sep)
+            file_info['parent_folder_name'] = os.path.sep.join(path_parts[:-1]) if len(path_parts) > 1 else '根目录'
+        return all_files_with_path
     
+    async def _download_and_save_file(self, group_id: int, file_id: str, file_name: str, file_size: int, relative_path: str, root_dir: str, client) -> bool:
+        log_prefix = f"[群文件备份-{group_id}-下载]"
+        target_path = os.path.join(root_dir, relative_path)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+        if os.path.exists(target_path):
+            try:
+                # 检查已存在文件的大小是否与目标文件大小匹配
+                existing_size = os.path.getsize(target_path)
+                if existing_size == file_size:
+                    logger.info(f"{log_prefix} 文件 '{file_name}' 已存在 ({utils.format_bytes(file_size)})，跳过下载。")
+                    return True
+                else:
+                    logger.warning(f"{log_prefix} 文件 '{file_name}' 存在但大小不匹配 ({utils.format_bytes(existing_size)} != {utils.format_bytes(file_size)})，重新下载。")
+                    os.remove(target_path) # 大小不一致，先删除再下载
+            except Exception as e:
+                logger.warning(f"{log_prefix} 检查文件 '{file_name}' 大小失败 ({e})，尝试重新下载。")
+                try:
+                    os.remove(target_path)
+                except:
+                    pass
+
+        try:
+            # 1. 获取下载链接
+            url_result = await client.api.call_action('get_group_file_url', group_id=group_id, file_id=file_id)
+            if not (url_result and url_result.get('url')):
+                logger.error(f"{log_prefix} 无法获取文件 '{file_name}' 的下载链接或文件已失效。")
+                return False
+            url = url_result['url']
+
+            # 2. 下载文件，使用信号量控制并发
+            async with aiohttp.ClientSession() as session:
+                async with self.download_semaphore:
+                    async with session.get(url, timeout=60) as resp:
+                        if resp.status != 200:
+                            logger.error(f"{log_prefix} 下载文件 '{file_name}' 失败 (HTTP: {resp.status})。")
+                            return False
+                        
+                        # 3. 写入文件，注意捕获 OS 异常（如磁盘空间不足）
+                        with open(target_path, 'wb') as f:
+                            async for chunk in resp.content.iter_chunked(8192):
+                                f.write(chunk)
+            
+            logger.info(f"{log_prefix} 成功下载文件 '{file_name}' ({utils.format_bytes(file_size)}) 到: {target_path}")
+            return True
+        except FileNotFoundError:
+            logger.error(f"{log_prefix} 创建目标文件路径失败 (FileNotFoundError)，可能目录创建失败。")
+            return False
+        except OSError as e:
+            logger.error(f"{log_prefix} 写入文件 '{file_name}' 时发生 OS 错误 (可能空间不足): {e}", exc_info=True)
+            return False
+        except Exception as e:
+            logger.error(f"{log_prefix} 下载文件 '{file_name}' 时发生未知异常: {e}", exc_info=True)
+            return False
+
+    async def _cleanup_backup_temp(self, backup_dir: str, zip_path: Optional[str]):
+        """异步清理备份目录和生成的 ZIP 文件。"""
+        try:
+            await asyncio.sleep(600)  # 等待10分钟后再清理
+            if os.path.exists(backup_dir):
+                for dirpath, dirnames, filenames in os.walk(backup_dir, topdown=False):
+                    for filename in filenames:
+                        os.remove(os.path.join(dirpath, filename))
+                    for dirname in dirnames:
+                        os.rmdir(os.path.join(dirpath, dirname))
+                os.rmdir(backup_dir)
+                logger.info(f"[群文件备份-清理] 已清理临时目录: {backup_dir}")
+            
+            await asyncio.sleep(5)
+
+            # 删除生成的 ZIP 文件
+            if zip_path and os.path.exists(os.path.dirname(zip_path)):
+                zip_base_name_no_ext = os.path.basename(zip_path).rsplit('.zip', 1)[0]
+                temp_base_dir = os.path.dirname(zip_path)
+                
+                # 遍历所有可能的分卷文件并删除
+                for f in os.listdir(temp_base_dir):
+                    if f.startswith(zip_base_name_no_ext):
+                         file_to_delete = os.path.join(temp_base_dir, f)
+                         os.remove(file_to_delete)
+                         logger.info(f"[群文件备份-清理] 已清理生成的压缩包/分卷: {f}")
+
+        except OSError as e:
+            logger.warning(f"[群文件备份-清理] 删除临时文件或目录失败: {e}")
+
+    async def _upload_and_send_file_via_api(self, event: AstrMessageEvent, file_path: str, file_name: str) -> bool:
+        log_prefix = f"[群文件备份-上传/发送]"
+        client = self.bot or event.client
+        target_id = int(event.get_sender_id())
+        group_id_str = event.get_group_id() 
+        file_uri = f"file://{file_path}"
+        
+        upload_result = None # 初始化变量
+        
+        try:
+            # 1. API Call
+            if group_id_str:
+                target_group_id = int(group_id_str)
+                logger.info(f"{log_prefix} 调用 /upload_group_file 上传文件到群 {target_group_id}")
+                upload_result = await client.api.call_action('upload_group_file', 
+                                                             group_id=target_group_id,
+                                                             file=file_uri,
+                                                             name=file_name,
+                                                             folder_id='/',
+                                                             timeout=300)
+                
+            else:
+                logger.info(f"{log_prefix} 调用 /upload_private_file 上传文件到私聊 {target_id}")
+                upload_result = await client.api.call_action('upload_private_file', 
+                                                             user_id=target_id,
+                                                             file=file_uri,
+                                                             name=file_name,
+                                                             timeout=300)
+
+            # 2. 检查 upload_result 是否为 None
+            if upload_result is None:
+                 logger.warning(f"{log_prefix} 文件 {file_name} 上传时 API 调用返回 NONE。根据测试经验，文件可能已在后台提交。")
+                 return True # 视为成功并继续下一个分卷
+            
+            # 3. 检查 API 响应状态：status='ok' 且 retcode=0 (正常成功)
+            if upload_result.get('status') == 'ok' and upload_result.get('retcode') == 0:
+                logger.info(f"{log_prefix} 文件 {file_name} 上传调用成功。")
+                return True
+            
+            # 4. 处理 API 明确返回失败状态
+            else:
+                error_msg = upload_result.get('wording', upload_result.get('errMsg', 'API返回失败'))
+                
+                # 如果返回的错误是 NTQQ 的 "rich media transfer failed" (retcode=1200)
+                if upload_result.get('retcode') == 1200:
+                    logger.error(f"{log_prefix} 文件 {file_name} 上传失败 (NTQQ内部拒绝: {error_msg})。视为致命失败，中断任务。")
+                    # 客户端拒绝，返回 False
+                    return False
+                else:
+                    # 其他非 1200 的失败码
+                    logger.warning(f"{log_prefix} 文件 {file_name} 上传失败 (retcode {upload_result.get('retcode')}). 详情: {error_msg}。容忍并继续。")
+                    return True
+
+        except ActionFailed as e:
+            # 捕获 ActionFailed
+            logger.warning(f"{log_prefix} 文件 {file_name} 上传时发生 ActionFailed (网络中断/超时)。错误: {e}")
+            return False # 视为失败，中断任务
+            
+        except Exception as e:
+            error_type = type(e).__name__
+            logger.warning(f"{log_prefix} 上传文件 {file_name} 时发生 Python 致命错误 ({error_type})。根据测试经验，文件可能已提交。错误: {e}", exc_info=True)
+            return False
+
     @filter.command("cdf")
     async def on_check_and_delete_command(self, event: AstrMessageEvent):
         if not self.bot: self.bot = event.bot
@@ -357,7 +529,7 @@ class GroupFSPlugin(Star):
             await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行此操作的权限。")]))
             return
         logger.info(f"[{group_id}] 用户 {user_id} 触发 /cf 失效文件检查指令。")
-        await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。")]))
+        await event.send(MessageChain([Comp.Plain("✅ 已开始扫描群内所有文件，查找失效文件...\n这可能需要几分钟，请耐心等待。\n如果未发现失效文件，将不会发送任何消息。")]))
         self.active_tasks.append(asyncio.create_task(self._perform_scheduled_check(group_id, False)))
         event.stop_event()
     
@@ -775,8 +947,288 @@ class GroupFSPlugin(Star):
                 except OSError as e:
                     logger.warning(f"删除临时文件 {local_file_path} 失败: {e}")
 
+    async def _create_zip_archive(self, source_dir: str, target_zip_path: str, password: str) -> bool:
+        """使用外部命令行工具 (7za) 压缩整个目录。"""
+        VOLUME_SIZE = '512m' 
+        try:
+            dir_to_zip = os.path.basename(source_dir)
+            parent_dir = os.path.dirname(source_dir)
+
+            # 7za a -tzip: 添加并创建 zip 格式归档
+            # -r: 递归
+            command = ['7za', 'a', '-tzip', target_zip_path, dir_to_zip, '-r', f'-v{VOLUME_SIZE}']
+            
+            if password:
+                # 7za 使用 -p[密码] 格式
+                command.append(f"-p{password}")
+            
+            logger.info(f"[群文件备份-压缩] 正在执行压缩命令: {' '.join(command)}")
+            
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=parent_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                error_message = stderr.decode('utf-8', errors='ignore')
+                logger.error(f"[群文件备份-压缩] 打包失败，返回码 {process.returncode}: {error_message}")
+                return False
+            
+            logger.info(f"[群文件备份-压缩] 打包成功: {target_zip_path}")
+            return True
+
+        except FileNotFoundError:
+            logger.error("[群文件备份-压缩] 压缩失败：容器内未找到 7za 命令。请安装 p7zip-full 或 7-Zip。")
+            return False
+        except Exception as e:
+            logger.error(f"[群文件备份-压缩] 打包时发生未知错误: {e}", exc_info=True)
+            return False
+
+    async def _perform_group_file_backup(self, event: AstrMessageEvent, group_id: int):
+        log_prefix = f"[群文件备份-{group_id}]"
+        backup_root_dir = None
+        final_zip_path = None
+        
+        try:
+            client = self.bot or event.bot
+            
+            # 1. 预通知：获取群文件系统信息
+            logger.info(f"{log_prefix} 正在获取群文件系统原始信息...")
+            system_info = await client.api.call_action('get_group_file_system_info', group_id=group_id)
+            
+            # 记录原始的系统信息字典
+            logger.info(f"{log_prefix} --- 群文件系统原始信息 START ---")
+            for key, value in system_info.items():
+                # 针对大整数进行格式化，便于阅读
+                if isinstance(value, int) and ('space' in key or 'count' in key):
+                    logger.info(f"{log_prefix} | {key}: {value} ({utils.format_bytes(value)})")
+                else:
+                    logger.info(f"{log_prefix} | {key}: {value}")
+            logger.info(f"{log_prefix} --- 群文件系统原始信息 END ---")
+
+            total_count = system_info.get('file_count', '未知')
+            
+            notification = (
+                f"备份任务已启动，目标群ID: {group_id}。\n"
+                f"该群文件总数: {total_count}。\n"
+                f"备份操作将遍历所有文件，请耐心等待，这可能需要几分钟。"
+            )
+            await event.send(MessageChain([Comp.Plain(notification)]))
+            logger.info(f"{log_prefix} 预通知已发送。")
+
+            # 2. 准备工作：获取群名、创建本地临时目录
+            group_info = await client.api.call_action('get_group_info', group_id=group_id)
+            group_name = group_info.get('group_name', str(group_id))
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            
+            temp_plugin_dir = os.path.join(get_astrbot_data_path(), 'plugins_data', 'astrbot_plugin_GroupFS')
+            temp_base_dir = os.path.join(temp_plugin_dir, 'temp_backup_cache') 
+            
+            # 实际存放文件和最终 zip 的目录
+            backup_root_dir = os.path.join(temp_base_dir, f"{group_name}") 
+            
+            # 创建目录
+            os.makedirs(backup_root_dir, exist_ok=True)
+            logger.info(f"{log_prefix} 本地备份目录: {backup_root_dir}")
+
+            # 3. 递归获取所有文件信息
+            all_files_info = await self._get_all_files_with_path(group_id, client)
+            
+            # 4. 过滤和下载文件
+            total_file_count_all = len(all_files_info)
+            downloaded_files_count = 0
+            downloaded_files_size = 0
+            failed_downloads = []
+            
+            size_limit_bytes = self.backup_file_size_limit_mb * 1024 * 1024
+            
+            for i, file_info in enumerate(all_files_info):
+                file_name = file_info.get('file_name', '未知文件')
+                file_id = file_info.get('file_id')
+                file_size = file_info.get('size', 0)
+                relative_path = file_info.get('relative_path', '')
+                
+                logger.info(f"{log_prefix} ({i+1}/{total_file_count_all}) 正在检查文件: '{file_name}'")
+
+                # 4.1. 过滤：大小和后缀名
+                if size_limit_bytes > 0 and file_size > size_limit_bytes:
+                    logger.warning(f"{log_prefix} 文件 '{file_name}' ({utils.format_bytes(file_size)}) 超过大小限制 ({self.backup_file_size_limit_mb}MB)，跳过。")
+                    continue
+                
+                _, ext = os.path.splitext(file_name)
+                ext = ext[1:].lower()
+                if self.backup_file_extensions and ext not in self.backup_file_extensions:
+                    logger.warning(f"{log_prefix} 文件 '{file_name}' (.{ext}) 不在允许的后缀名范围 {self.backup_file_extensions} 内，跳过。")
+                    continue
+                
+                # 4.2. 下载
+                download_success = await self._download_and_save_file(
+                    group_id, file_id, file_name, file_size, relative_path, backup_root_dir, client
+                )
+                
+                if download_success:
+                    downloaded_files_count += 1
+                    downloaded_files_size += file_size
+                else:
+                    failed_downloads.append(file_name)
+
+                #await asyncio.sleep(0.5) # 下载间隔
+
+            # 5. 压缩整个目录
+            final_zip_name = f"{group_name}_备份_{timestamp}.zip"
+            final_zip_path = os.path.join(temp_base_dir, final_zip_name)
+            
+            logger.info(f"{log_prefix} 文件下载完成，共成功下载 {downloaded_files_count} 个文件，开始压缩...")
+
+            zip_success = False
+
+            if downloaded_files_count > 0:
+                 zip_success = await self._create_zip_archive(backup_root_dir, final_zip_path, self.backup_zip_password)
+            else:
+                logger.warning(f"{log_prefix} 没有符合条件的文件需要备份，跳过压缩。")
+                
+            # 6. 发送和清理
+            if zip_success:
+                
+                temp_base_dir = os.path.dirname(final_zip_path)
+                # 基础名：不包含 .zip 部分 (如 'bot测试_备份_20251003_134542')
+                zip_base_name_no_ext = os.path.basename(final_zip_path).rsplit('.zip', 1)[0]
+                
+                all_volumes = []
+                
+                logger.info(f"{log_prefix} 正在查找所有分卷文件，基础名: {zip_base_name_no_ext}，目录: {temp_base_dir}")
+                
+                # 查找所有分卷：匹配 '基础名' + '.zip' + '.' + 数字
+                for f in os.listdir(temp_base_dir):
+                    logger.debug(f"{log_prefix} 目录项: {f}")
+                    f_path = os.path.join(temp_base_dir, f)
+                    if f.startswith(zip_base_name_no_ext) and (f.endswith('.zip') or f.split('.')[-1].isdigit()):
+                         # 确保我们只添加主文件和分卷文件，排除其他无关文件
+                         if f == os.path.basename(final_zip_path) or f.startswith(f"{zip_base_name_no_ext}.zip."):
+                            all_volumes.append(f_path)
+                            try:
+                                file_size = os.path.getsize(f_path)
+                                logger.info(f"[{log_prefix}] 识别到分卷文件: {f} ({utils.format_bytes(file_size)})")
+                            except Exception as e:
+                                logger.warning(f"[{log_prefix}] 识别到分卷文件: {f} (获取大小失败: {e})")
+
+                all_volumes.sort() # 确保按顺序发送
+                
+                is_single_volume = len(all_volumes) == 1
+                
+                logger.info(f"{log_prefix} 找到分卷文件数: {len(all_volumes)}")
+                
+                if is_single_volume:
+                    original_path = all_volumes[0]
+                    original_name = os.path.basename(original_path)
+                    
+                    new_volume_name = f"{zip_base_name_no_ext}.zip"
+                    new_volume_path = os.path.join(temp_base_dir, new_volume_name)
+                    
+                    os.rename(original_path, new_volume_path) # 执行重命名
+                    all_volumes = [new_volume_path] # 更新列表为新的路径
+                    
+                    logger.info(f"{log_prefix} [重命名] 单分卷重命名成功: '{original_name}' -> '{new_volume_name}'")
+
+                if not all_volumes:
+                    # 如果压缩成功，但一个文件都没找到，说明路径或匹配有问题
+                    await event.send(MessageChain([Comp.Plain(f"❌ 备份压缩成功，但未在目录中找到任何生成的压缩文件！请检查日志。")]))
+                    zip_success = False 
+                    
+                else:
+                    # 构造回复消息
+                    reply_message = (
+                        f"✅ 群文件备份完成！\n"
+                        f"成功备份文件数: {downloaded_files_count} 个 (总大小: {utils.format_bytes(downloaded_files_size)})\n"
+                        f"{'共' if len(all_volumes) > 1 else ''} {len(all_volumes)} 个文件即将发送，请注意接收！"
+                    )
+                    if failed_downloads:
+                        reply_message += f"\n⚠️ 备份失败文件数: {len(failed_downloads)} 个 (详见日志)"
+                    
+                    await event.send(MessageChain([Comp.Plain(reply_message)]))
+
+                    # 逐个发送分卷文件
+                    all_sent_success = True
+                    for volume_path in all_volumes:
+                        volume_name = os.path.basename(volume_path)
+                        logger.info(f"{log_prefix} 正在发送分卷: {volume_name}...")
+                        
+                        if not await self._upload_and_send_file_via_api(event, volume_path, volume_name):
+                            all_sent_success = False
+                            # 发送失败通知给用户
+                            await event.send(MessageChain([Comp.Plain(f"❌ 文件 {volume_name} 发送失败，请检查 Bot 配置。")]))
+                            break
+                            
+                    if not all_sent_success:
+                        await event.send(MessageChain([Comp.Plain(f"❌ 备份发送中断。请检查日志。")]))
+                    
+                        
+            elif downloaded_files_count == 0:
+                 await event.send(MessageChain([Comp.Plain(f"ℹ️ 备份任务完成。但没有找到符合大小或后缀名限制的任何文件。")]))
+            else:
+                await event.send(MessageChain([Comp.Plain(f"❌ 备份任务失败：压缩文件失败或找不到压缩包。请检查后台日志。")]))
+            
+        except Exception as e:
+            logger.error(f"{log_prefix} 备份任务执行过程中发生未知异常: {e}", exc_info=True)
+            await event.send(MessageChain([Comp.Plain(f"❌ 备份任务执行失败，发生内部错误。请检查后台日志。")]))
+        finally:
+             asyncio.create_task(self._cleanup_backup_temp(backup_root_dir, final_zip_path))
+
+    @filter.command("gfb")
+    async def on_group_file_backup_command(self, event: AstrMessageEvent):
+        if not self.bot: self.bot = event.bot
+        
+        # 1. 解析目标群ID
+        group_id_str = event.get_group_id()
+        user_id = int(event.get_sender_id())
+        
+        command_parts = event.message_str.split()
+        target_group_id: Optional[int] = None
+        
+        if len(command_parts) > 1:
+            try:
+                target_group_id = int(command_parts[1])
+            except ValueError:
+                await event.send(MessageChain([Comp.Plain("❌ 格式错误：请提供有效的群号。用法: /gfb [群号]")]))
+                return
+        elif group_id_str:
+            # 群聊中且没有参数，备份当前群
+            target_group_id = int(group_id_str)
+        else:
+            # 私聊中且没有参数
+            await event.send(MessageChain([Comp.Plain("❌ 格式错误：在私聊中请指定要备份的群号。用法: /gfb <群号>")]))
+            return
+
+        logger.info(f"用户 {user_id} 触发 /gfb 备份指令，目标群ID: {target_group_id}")
+
+        # 2. 权限和白名单校验
+        if user_id not in self.admin_users:
+            await event.send(MessageChain([Comp.Plain("⚠️ 您没有执行群文件备份操作的权限。")]))
+            return
+        
+        if self.group_whitelist and target_group_id not in self.group_whitelist:
+            await event.send(MessageChain([Comp.Plain("⚠️ 目标群聊不在插件配置的白名单中，操作已拒绝。")]))
+            return
+
+        # 3. 启动异步备份任务
+        self.active_tasks.append(asyncio.create_task(
+            self._perform_group_file_backup(event, target_group_id)
+        ))
+        event.stop_event()
+
     async def terminate(self):
-        logger.info("插件 [群文件系统GroupFS] 正在卸载，取消所有定时任务...")
+        logger.info("插件 [群文件系统GroupFS] 正在卸载，取消所有任务...")
+
+        if self.scheduler and self.scheduler.running:
+            try:
+                self.scheduler.shutdown(wait=False) 
+                logger.info("APScheduler 定时任务调度器已成功停止。")
+            except Exception as e:
+                logger.error(f"停止 APScheduler 时发生错误: {e}")
+
         for task in self.active_tasks:
             if not task.done():
                 task.cancel()
