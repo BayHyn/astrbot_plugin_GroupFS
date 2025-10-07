@@ -100,12 +100,12 @@
 | `preview_length` | `int` | 文本预览长度。使用 `/sf ... <序号>` 指令时，显示的内容预览的最大字符数。默认为 300。 |
 | `enable_zip_preview` | `bool` | 启用对 `.zip` 压缩包内文本文件的预览功能。 |
 | `default_zip_password` | `string` | 当尝试预览加密的 `.zip` 文件时，会首先使用此密码尝试解压。|
-| **`backup_zip_password`** | **`string`** | **备份压缩包加密密码。使用 `/gfb` 指令备份时，生成的 ZIP 包将使用此密码加密。留空则不加密。** |
-| **`backup_file_size_limit_mb`** | **`int`** | **单文件备份大小上限 (MB)。超过此大小的文件将跳过备份。设置为 0 则表示无限制。** |
-| **`backup_file_extensions`** | **`text`** | **允许备份的文件扩展名。用逗号分隔（如：`txt,pdf,jpg`）。留空则备份所有文件。** |
 | `storage_limits` | `list` | 群文件容量监控阈值。格式为 `"群号:文件数量上限:空间上限GB"` 的字符串列表，例如 `"123456:1000:9.5"`。 |
 | `scheduled_check_tasks` | `list` | 定时失效文件检查任务。格式为 `"群号:cron表达式"`，例如 `"123456:0 3 * * 1"` 代表每周一凌晨3点检查。 |
 | `forward_threshold` | `int` | 长消息合并转发阈值。当插件的单条回覆超过此字数时，将自动转为合并转发。设置为 0 则禁用此功能。 |
+| `backup_zip_password` | `string` | 备份压缩包加密密码。使用 `/gfb` 指令备份时，生成的 ZIP 包将使用此密码加密。留空则不加密。 |
+| `backup_file_size_limit_mb` | `int` | 单文件备份大小上限 (MB)。超过此大小的文件将跳过备份。设置为 0 则表示无限制。 |
+| `backup_file_extensions` | `text` | 允许备份的文件扩展名。用逗号分隔（如：`txt,pdf,jpg`）。留空则备份所有文件。 |
 
 ---
 
